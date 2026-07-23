@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "bitcoin-public-datasets",
+  "namespace": "io.github.google",
+  "description": "Bitcoin public datasets — tables (blocks, transactions, inputs, outputs) and references for on-chain analytics on BigQuery.",
+  "version": "0.1.0",
+  "source": {
+    "type": "github",
+    "url": "https://github.com/GoogleCloudPlatform/knowledge-catalog",
+    "path": "okf/bundles/crypto_bitcoin",
+    "ref": "d44368c15e38e7c92481c5992e4f9b5b421a801d"
+  },
+  "kind": "knowledge",
+  "categories": ["crypto", "bitcoin", "bigquery"],
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf/bundles/crypto_bitcoin"
+}
