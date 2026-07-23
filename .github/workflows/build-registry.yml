@@ -29,9 +29,14 @@ jobs:
       - run: node scripts/build-registry.mjs
 
       - name: Push registry.json to okfhub-website
+        env:
+          SITE_TOKEN: ${{ secrets.OKFHUB_WEBSITE_TOKEN }}
         run: |
           set -e
-          git clone --depth 1 https://github.com/asagajda/okfhub-website.git /tmp/site
+          # asagajda/okfhub-website is PRIVATE — both clone and push need the PAT
+          # (an unauthenticated clone fails in CI: "could not read Username").
+          # SITE_TOKEN is passed via env, never echoed (no `set -x`).
+          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" /tmp/site
           cp registry.json /tmp/site/public/registry.json
           cd /tmp/site
           git config user.name "okfhub-registry-bot"
@@ -42,4 +47,4 @@ jobs:
             exit 0
           fi
           git commit -m "chore: regenerate registry.json [skip ci]"
-          git push https://x-access-token:${{ secrets.OKFHUB_WEBSITE_TOKEN }}@github.com/asagajda/okfhub-website.git main
+          git push "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" main
