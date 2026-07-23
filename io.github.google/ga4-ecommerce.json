@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "ga4-ecommerce",
+  "namespace": "io.github.google",
+  "description": "GA4 Google Merchandise Store e-commerce dataset — tables, metrics, and join references.",
+  "version": "0.1.0",
+  "source": {
+    "type": "github",
+    "url": "https://github.com/GoogleCloudPlatform/knowledge-catalog",
+    "path": "okf/bundles/ga4",
+    "ref": "d44368c15e38e7c92481c5992e4f9b5b421a801d"
+  },
+  "kind": "knowledge",
+  "categories": ["analytics", "ecommerce", "bigquery"],
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf/bundles/ga4"
+}
