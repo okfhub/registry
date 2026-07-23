@@ -1,0 +1,13 @@
+{
+  "name": "okfhub-registry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "okfhub bundle registry — aggregator that validates manifests and builds registry.json.",
+  "scripts": {
+    "build": "node scripts/build-registry.mjs"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  }
+}

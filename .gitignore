@@ -1,0 +1,5 @@
+node_modules/
+# registry.json is a generated artifact (produced by scripts/build-registry.mjs).
+# The GitHub Action commits it cross-repo into okfhub-website/public/registry.json;
+# it is not hand-authored here.
+registry.json
