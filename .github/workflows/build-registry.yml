@@ -1,0 +1,45 @@
+# Build registry.json — validates every manifest and commits the aggregated
+# index cross-repo into okfhub-website/public/registry.json (D-04 one-way
+# contract). Triggered by a manifest push or manually via workflow_dispatch.
+#
+# The cross-repo push uses a fine-grained PAT (OKFHUB_WEBSITE_TOKEN, D-05)
+# scoped to asagajda/okfhub-website ONLY — the default GITHUB_TOKEN cannot push
+# cross-repo. The push step runs with `set -e` and NO `set -x` so the
+# token-bearing git remote URL is never echoed to the log (RESEARCH §1.2).
+name: Build registry.json
+
+on:
+  push:
+    paths:
+      - "io.github.google/**/*.json"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: node scripts/build-registry.mjs
+
+      - name: Push registry.json to okfhub-website
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/asagajda/okfhub-website.git /tmp/site
+          cp registry.json /tmp/site/public/registry.json
+          cd /tmp/site
+          git config user.name "okfhub-registry-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/registry.json
+          if git diff --staged --quiet; then
+            echo "no change — registry.json already up to date"
+            exit 0
+          fi
+          git commit -m "chore: regenerate registry.json [skip ci]"
+          git push https://x-access-token:${{ secrets.OKFHUB_WEBSITE_TOKEN }}@github.com/asagajda/okfhub-website.git main
