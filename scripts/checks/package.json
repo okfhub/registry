@@ -1,0 +1,13 @@
+{
+  "name": "okfhub-registry-checks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Merge-gate check functions for okfhub/registry publish PRs — pure, testable, zod-backed schema validation.",
+  "scripts": {
+    "test": "node --test ../../tests/checks/"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  }
+}
