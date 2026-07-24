@@ -11,7 +11,13 @@ name: Build registry.json
 on:
   push:
     paths:
-      - "io.github.google/**/*.json"
+      # D-20 fix (Phase 3): single-segment glob matches ANY io.github.<org>
+      # namespace, so external publishes (io.github.stripe/, io.github.<login>/)
+      # trigger the aggregator the same as io.github.google/. Previously this
+      # was `io.github.google/**/*.json` — only the google namespace propagated,
+      # silently dropping every external publish. Do NOT revert to the google-
+      # only filter.
+      - "io.github.*/*.json"
   workflow_dispatch: {}
 
 permissions:

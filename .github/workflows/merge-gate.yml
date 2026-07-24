@@ -1,0 +1,65 @@
+# Merge-gate — the self-merging publish-PR gate (Phase 3, AUTH-04 / D-08).
+#
+# This workflow is BOTH checker AND merger (D-08). It runs on every pull_request
+# targeting main, evaluates schema + path-scope + ownership + rate-limit checks
+# (in scripts/checks/merge-gate.mjs), and auto-merges on all-green or posts a
+# comment naming the failed check on failure (D-12).
+#
+# AUTO-MERGES WITH NO CONTENT-SAFETY GATE (Layer 1 accepted-risk; Layer 3
+# scanner deferred on LLM budget). Namespace-ownership + path-scope +
+# rate-limit are the only gates. Documented in 03-CONTEXT.md AUTH-04 / D-09.
+#
+# TOKEN (D-11): the merge uses an App INSTALLATION token minted via
+# actions/create-github-app-token — NOT the default GITHUB_TOKEN. The default
+# token cannot trigger downstream workflows (build-registry.yml), so the
+# post-merge registry.json rebuild would never run. The App private key lives
+# as the repo secret OKFHUB_APP_PRIVATE_KEY and is never echoed (no `set -x`).
+name: Merge publish PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write        # the merge push
+  pull-requests: write   # the merge call + failure comments
+  members: read          # org-membership lookup in ownership check
+
+jobs:
+  gate:
+    # Only gate PRs targeting main (publish PRs land on main).
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Install the check scripts' zod dep (scripts/checks/package.json).
+      # Mirrors build-registry.yml's npm ci pattern.
+      - name: Install check deps
+        run: npm ci
+        working-directory: scripts/checks
+
+      # Mint an App INSTALLATION token (D-11). inputs:
+      #   app-id     ← OKFHUB_APP_ID repo variable
+      #   private-key ← OKFHUB_APP_PRIVATE_KEY repo secret (the .pem)
+      #   owner + repositories ← scope the token to okfhub/registry only (D-03
+      #                            least-privilege — never "all repos").
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.OKFHUB_APP_ID }}
+          private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}
+          owner: okfhub
+          repositories: registry
+
+      # Run the gate. The installation token is passed as GITHUB_TOKEN (the
+      # env var merge-gate.mjs reads). NO `set -x` — the token must not echo.
+      - name: Run merge-gate
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: node scripts/checks/merge-gate.mjs
