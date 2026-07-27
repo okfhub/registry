@@ -74,6 +74,14 @@ jobs:
           private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}
           owner: okfhub
           repositories: registry
+          # Explicitly request the write scopes the merge + comments need.
+          # Per the action's docs: "Setting a permission that the installation
+          # does not have will result in an error." So if the install lacks
+          # Contents:write, this step fails with a clear message (instead of a
+          # confusing 403 downstream at the merge call). If it succeeds, the
+          # token provably has write.
+          permission-contents: write
+          permission-pull-requests: write
 
       # DIAGNOSTIC (temporary): decode the minted token's ACTUAL permissions and
       # probe the merge endpoint directly. This tells us, from ground truth,
