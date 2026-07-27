@@ -93,18 +93,30 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          echo "=== THE MERGE CALL ITSELF, with full response (incl headers) ==="
-          echo "This replicates exactly what gate-merge does, but shows the response body + headers."
-          HEAD_SHA=$(gh api "/repos/okfhub/registry/pulls/2" --jq '.head.sha')
-          echo "head sha: $HEAD_SHA"
+          echo "=== PROBE 1: can the App PUSH a commit directly to main? (raw contents:write) ==="
+          echo "(creates a throwaway file then deletes it — proves contents:write works for PUSH)"
+          MAIN_SHA=$(gh api "/repos/okfhub/registry/contents/.diag-probe" --jq '.sha' 2>/dev/null || echo "none")
+          gh api -X PUT "/repos/okfhub/registry/contents/.diag-probe" \
+            -f message="diag: contents-write probe (will revert)" \
+            -f content="$(echo 'probe' | base64)" \
+            ${MAIN_SHA:+-f sha="$MAIN_SHA"} 2>&1 | head -8
           echo
+          echo "=== cleanup the probe file ==="
+          DEL_SHA=$(gh api "/repos/okfhub/registry/contents/.diag-probe" --jq '.sha' 2>/dev/null || echo "")
+          if [ -n "$DEL_SHA" ]; then
+            gh api -X DELETE "/repos/okfhub/registry/contents/.diag-probe" \
+              -f message="diag: revert contents-write probe" \
+              -f sha="$DEL_SHA" 2>&1 | head -3
+          fi
+          echo
+          echo "=== PROBE 2: the merge call with full response headers ==="
+          HEAD_SHA=$(gh api "/repos/okfhub/registry/pulls/2" --jq '.head.sha')
           curl -sS -i -X PUT \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
             -H "Content-Type: application/json" \
-            -d "{\"commit_title\":\"diag merge probe\",\"merge_method\":\"squash\",\"sha\":\"$HEAD_SHA\"}" \
-            "https://api.github.com/repos/okfhub/registry/pulls/2/merge" 2>&1 | head -40
+            -d "{\"merge_method\":\"squash\",\"sha\":\"$HEAD_SHA\"}" \
+            "https://api.github.com/repos/okfhub/registry/pulls/2/merge" 2>&1 | /usr/bin/grep -iE "HTTP/|x-accepted|message|status" | head -10
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
