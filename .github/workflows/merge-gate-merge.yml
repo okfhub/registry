@@ -62,10 +62,9 @@ jobs:
       #   owner + repositories ← scope the token to okfhub/registry only (D-03
       #                            least-privilege — never "all repos").
       #   permission-contents / permission-pull-requests ← explicitly request
-      #     the write scopes the merge + comments need. The token's effective
-      #     permissions are the INTERSECTION of (App config) ∩ (these inputs)
-      #     ∩ (install repo grant). Making the request explicit rules out any
-      #     ambiguity about what was requested.
+      #     the write scopes the merge + comments need. Per the action's docs,
+      #     requesting a permission the install lacks results in an error, so a
+      #     green step proves the token carries these writes.
       - name: Mint App installation token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -74,49 +73,8 @@ jobs:
           private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}
           owner: okfhub
           repositories: registry
-          # Explicitly request the write scopes the merge + comments need.
-          # Per the action's docs: "Setting a permission that the installation
-          # does not have will result in an error." So if the install lacks
-          # Contents:write, this step fails with a clear message (instead of a
-          # confusing 403 downstream at the merge call). If it succeeds, the
-          # token provably has write.
           permission-contents: write
           permission-pull-requests: write
-
-      # DIAGNOSTIC (temporary): decode the minted token's ACTUAL permissions and
-      # probe the merge endpoint directly. This tells us, from ground truth,
-      # whether the 403 is a token-permission issue or an installation/repo-
-      # access issue. Safe: prints permission names only (never the token).
-      # The X-OAuth-Scopes header is empty for App tokens, but /user/codescoping
-      # and the per-resource permissions are visible. Remove once resolved.
-      - name: Diagnose token permissions
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          echo "=== PROBE 1: can the App PUSH a commit directly to main? (raw contents:write) ==="
-          echo "(creates a throwaway file then deletes it — proves contents:write works for PUSH)"
-          MAIN_SHA=$(gh api "/repos/okfhub/registry/contents/.diag-probe" --jq '.sha' 2>/dev/null || echo "none")
-          gh api -X PUT "/repos/okfhub/registry/contents/.diag-probe" \
-            -f message="diag: contents-write probe (will revert)" \
-            -f content="$(echo 'probe' | base64)" \
-            ${MAIN_SHA:+-f sha="$MAIN_SHA"} 2>&1 | head -8
-          echo
-          echo "=== cleanup the probe file ==="
-          DEL_SHA=$(gh api "/repos/okfhub/registry/contents/.diag-probe" --jq '.sha' 2>/dev/null || echo "")
-          if [ -n "$DEL_SHA" ]; then
-            gh api -X DELETE "/repos/okfhub/registry/contents/.diag-probe" \
-              -f message="diag: revert contents-write probe" \
-              -f sha="$DEL_SHA" 2>&1 | head -3
-          fi
-          echo
-          echo "=== PROBE 2: the merge call with full response headers ==="
-          HEAD_SHA=$(gh api "/repos/okfhub/registry/pulls/2" --jq '.head.sha')
-          curl -sS -i -X PUT \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -H "Content-Type: application/json" \
-            -d "{\"merge_method\":\"squash\",\"sha\":\"$HEAD_SHA\"}" \
-            "https://api.github.com/repos/okfhub/registry/pulls/2/merge" 2>&1 | /usr/bin/grep -iE "HTTP/|x-accepted|message|status" | head -10
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
