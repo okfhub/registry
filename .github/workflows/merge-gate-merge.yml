@@ -93,17 +93,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          echo "=== token /user response (what the App token identifies as) ==="
-          gh api /user --jq '{login, type, id}' || true
+          echo "=== the App's fine-grained permissions (the CORRECT field) ==="
+          gh api "/installation/repositories" --jq '.repositories[] | {full_name, role_name}' || true
           echo
-          echo "=== /installation/repositories — what repos can this token see? ==="
-          gh api "/installation/repositories" --jq '.repositories[] | {full_name, permissions}' || true
+          echo "=== WRITE PROBE: can the token post a comment to PR #2? ==="
+          echo "(this tests if the token has pull-requests:write AT ALL)"
+          gh api "/repos/okfhub/registry/issues/2/comments" -f body="diag: write probe from merge-gate diagnostic step" 2>&1 | head -5
           echo
-          echo "=== repo-level permissions for okfhub/registry ==="
-          gh api "/repos/okfhub/registry" --jq '.permissions' || true
-          echo
-          echo "=== the App installation's permissions ==="
-          gh api "/repos/okfhub/registry/installation" --jq '{permissions: .permissions, repository_selection: .repository_selection}' || true
+          echo "=== WRITE PROBE 2: can the token GET the PR's merge endpoint (HEAD-ish)? ==="
+          gh api "/repos/okfhub/registry/pulls/2" --jq '{mergeable_state: .mergeable_state, merge_commit_sha: .merge_commit_sha, head: .head.sha[0:8]}' || true
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
