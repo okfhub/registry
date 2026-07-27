@@ -61,6 +61,11 @@ jobs:
       #   private-key ← OKFHUB_APP_PRIVATE_KEY repo secret (the .pem)
       #   owner + repositories ← scope the token to okfhub/registry only (D-03
       #                            least-privilege — never "all repos").
+      #   permission-contents / permission-pull-requests ← explicitly request
+      #     the write scopes the merge + comments need. The token's effective
+      #     permissions are the INTERSECTION of (App config) ∩ (these inputs)
+      #     ∩ (install repo grant). Making the request explicit rules out any
+      #     ambiguity about what was requested.
       - name: Mint App installation token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -69,6 +74,28 @@ jobs:
           private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}
           owner: okfhub
           repositories: registry
+
+      # DIAGNOSTIC (temporary): decode the minted token's ACTUAL permissions and
+      # probe the merge endpoint directly. This tells us, from ground truth,
+      # whether the 403 is a token-permission issue or an installation/repo-
+      # access issue. Safe: prints permission names only (never the token).
+      # The X-OAuth-Scopes header is empty for App tokens, but /user/codescoping
+      # and the per-resource permissions are visible. Remove once resolved.
+      - name: Diagnose token permissions
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          echo "=== token /user response (what the App token identifies as) ==="
+          gh api /user --jq '{login, type, id}' || true
+          echo
+          echo "=== /installation/repositories — what repos can this token see? ==="
+          gh api "/installation/repositories" --jq '.repositories[] | {full_name, permissions}' || true
+          echo
+          echo "=== repo-level permissions for okfhub/registry ==="
+          gh api "/repos/okfhub/registry" --jq '.permissions' || true
+          echo
+          echo "=== the App installation's permissions ==="
+          gh api "/repos/okfhub/registry/installation" --jq '{permissions: .permissions, repository_selection: .repository_selection}' || true
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
