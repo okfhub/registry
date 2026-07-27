@@ -75,6 +75,9 @@ jobs:
           repositories: registry
           permission-contents: write
           permission-pull-requests: write
+          # Administration:write is a TEST — the merge endpoint may require
+          # collaborator-level authority that only this scope grants for bots.
+          permission-administration: write
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
