@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "name": "test-bundle",
+  "namespace": "io.github.asagajda",
+  "description": "E2E test — delete after verifying.",
+  "version": "0.0.1",
+  "source": {
+    "type": "github",
+    "url": "https://github.com/asagajda/test-okf",
+    "path": "",
+    "ref": "main"
+  },
+  "kind": "knowledge",
+  "categories": [
+    "test"
+  ]
+}
