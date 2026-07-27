@@ -3,8 +3,9 @@
 //
 // Run:  npm ci && node scripts/build-registry.mjs
 //
-// Reads every `*.json` manifest under `io.github.google/` (the real namespace
-// layout of this repo), validates each against the vendored ManifestSchema, and
+// Reads every `*.json` manifest under every `io.github.*/` namespace dir in
+// this repo (io.github.google/, io.github.asagajda/, any io.github.<login>/),
+// validates each against the vendored ManifestSchema, and
 // emits a flat `{ generated_at, count, bundles: Manifest[] }` at the repo root.
 // The GitHub Action (.github/workflows/build-registry.yml) commits that file
 // cross-repo into okfhub-website/public/registry.json.
@@ -43,21 +44,43 @@ export const ManifestSchema = z.object({
   homepage: z.string().url().optional(),
 });
 
-const MANIFESTS_DIR = "io.github.google";
+// Scan EVERY io.github.* namespace directory, not just io.github.google. The
+// D-20 fix updated the trigger's paths filter to `io.github.*/*.json` so
+// external publishes (io.github.asagajda/, io.github.<any-login>/) fire the
+// build — but if the aggregator only reads io.github.google/, external
+// manifests trigger a build that then ignores them. Phase 3's self-publishing
+// feature relies on this being consistent: trigger + discovery must cover the
+// same set of namespaces.
+const NAMESPACE_GLOB = "io.github.*";
 const OUTPUT = "registry.json";
 
-/** Recursively collect every `*.json` under the namespace dir, sorted for stable output. */
-async function collectManifests(dir) {
-  const entries = await readdir(dir, { recursive: true, withFileTypes: false });
-  const files = entries
-    .filter((f) => typeof f === "string" && f.endsWith(".json"))
-    .map((f) => join(dir, f))
+/** Collect every `*.json` under all io.github.* namespace dirs, sorted for
+ *  stable output. Reads the top-level entries, filters to dirs matching the
+ *  namespace glob, then recursively collects manifests from each. */
+async function collectManifests() {
+  const top = await readdir(".", { withFileTypes: true });
+  const namespaceDirs = top
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .filter((name) => {
+      // Match io.github.<lowercase-identifier> — the namespace pattern the
+      // manifest schema enforces (manifest.namespace regex).
+      return /^io\.github\.[a-z0-9-]+$/.test(name);
+    })
     .sort();
-  return files;
+  const allFiles = [];
+  for (const dir of namespaceDirs) {
+    const entries = await readdir(dir, { recursive: true, withFileTypes: false });
+    const files = entries
+      .filter((f) => typeof f === "string" && f.endsWith(".json"))
+      .map((f) => join(dir, f));
+    allFiles.push(...files);
+  }
+  return allFiles.sort();
 }
 
 async function main() {
-  const files = await collectManifests(MANIFESTS_DIR);
+  const files = await collectManifests();
   const bundles = [];
   const errors = [];
 
