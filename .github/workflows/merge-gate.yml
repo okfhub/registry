@@ -23,7 +23,14 @@ on:
 permissions:
   contents: write        # the merge push
   pull-requests: write   # the merge call + failure comments
-  members: read          # org-membership lookup in ownership check
+  # NOTE: org-membership (the "members" scope) is NOT a valid workflow-level
+  # GITHUB_TOKEN permission — it's an org-scoped permission. The ownership check
+  # in merge-gate.mjs calls the members API with the App INSTALLATION token
+  # (minted by create-github-app-token, passed as GITHUB_TOKEN env), whose
+  # members:read comes from the App's own config, not this block. Including
+  # `members: read` here made GitHub reject the whole workflow file at parse
+  # time (run created → zero jobs → "workflow file issue"), so the gate never
+  # fired on any PR.
 
 jobs:
   gate:
