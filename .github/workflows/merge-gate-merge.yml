@@ -75,9 +75,12 @@ jobs:
           repositories: registry
           permission-contents: write
           permission-pull-requests: write
-          # Administration:write is a TEST — the merge endpoint may require
-          # collaborator-level authority that only this scope grants for bots.
-          permission-administration: write
+          # NOTE: Administration:write was tested as the merge unlock, but it
+          # grants repo-deletion + settings + collaborator + branch-protection
+          # control — violating D-03 least-privilege. This experiment removes
+          # it to test whether the merge still works now that the App install
+          # has been refreshed (the install-reauthorization side effect may be
+          # the real unlock, not the Administration scope itself).
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
