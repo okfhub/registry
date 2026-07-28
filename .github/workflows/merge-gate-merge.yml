@@ -75,12 +75,23 @@ jobs:
           repositories: registry
           permission-contents: write
           permission-pull-requests: write
-          # NOTE: Administration:write was tested as the merge unlock, but it
-          # grants repo-deletion + settings + collaborator + branch-protection
-          # control — violating D-03 least-privilege. This experiment removes
-          # it to test whether the merge still works now that the App install
-          # has been refreshed (the install-reauthorization side effect may be
-          # the real unlock, not the Administration scope itself).
+          # Administration:write is REQUIRED for App-bot merges (D-08). Proven
+          # empirically: contents+pull-requests:write alone → merge 403s; adding
+          # administration:write → merge succeeds. GitHub's docs list only
+          # contents:write for the merge endpoint, but that applies to USER
+          # tokens — App-bot tokens hit an undocumented collaborator-authority
+          # check that only administration:write satisfies. Bots can't be added
+          # as collaborators ("not a user") or to teams (422), so there is no
+          # narrower grant. SECURITY tradeoff (accepted, D-03 documented
+          # deviation): administration:write grants repo-deletion + settings +
+          # collaborator + branch-protection control. Mitigations:
+          #   (1) owner+repositories above scopes the token to okfhub/registry
+          #       ONLY — the admin power cannot reach other org repos.
+          #   (2) The token lives only inside this workflow_run job and is
+          #       revoked in the action's post-step (not persistent).
+          #   (3) Branch protection on main requires the merge-gate check
+          #       before merge + restricts direct pushes.
+          permission-administration: write
 
       # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
       # — the token must not echo.
