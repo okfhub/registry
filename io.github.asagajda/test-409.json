@@ -2,7 +2,7 @@
   "schema_version": 1,
   "name": "test-409",
   "namespace": "io.github.asagajda",
-  "description": "409 re-run corroboration test — safe to delete after.",
+  "description": "409 re-run corroboration test (UAT #5). Safe to delete after.",
   "version": "0.0.1",
   "source": { "type": "github", "url": "https://github.com/asagajda/registry", "path": "", "ref": "main" }
 }
