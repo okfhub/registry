@@ -71,6 +71,24 @@ export async function postComment(gh, repo, prNumber, body) {
   });
 }
 
+/** Neutralize attacker-controlled strings before they're interpolated into a
+ *  PR comment (audit M3). Manifest fields, namespace paths, and changed-file
+ *  names all come from a hostile PR and could otherwise inject Markdown
+ *  formatting, images/links, or (much less likely post-2020) workflow-command
+ *  directives via the comment body.
+ *
+ *  - Backslash-escapes the Markdown-active characters so they render literally
+ *    instead of formatting (` * _ [ ] # < > \).
+ *  - Collapses newlines to single spaces, defeating any `::`-prefixed line
+ *    that could be misread as a workflow command in an echo'd log.
+ *  This is display-only hygiene; the security checks themselves never rely on
+ *  comment text (D-05 identity is pull_request.user.login, not body/fields). */
+export function sanitizeForComment(s) {
+  return String(s ?? "")
+    .replace(/[\\`*_\[\]#<>]/g, (ch) => `\\${ch}`)
+    .replace(/[\r\n]+/g, " ");
+}
+
 /** Fetch the full list of changed files for a PR (paginated — uses per_page=100). */
 async function fetchChangedFiles(gh, repo, prNumber) {
   const res = await gh(`/repos/${repo}/pulls/${prNumber}/files?per_page=100`);
@@ -156,7 +174,7 @@ export async function evaluatePullRequest(gh, repo, pr) {
   if (!manifestPath) {
     return {
       passed: false,
-      reason: `⚠️ merge-gate: no \`io.github.<org>/<name>.json\` manifest found among the changed files (${changedFiles.join(", ")}). Publish PRs must add exactly one manifest under \`io.github.*\`.`,
+      reason: `⚠️ merge-gate: no \`io.github.<org>/<name>.json\` manifest found among the changed files (${changedFiles.map(sanitizeForComment).join(", ")}). Publish PRs must add exactly one manifest under \`io.github.*\`.`,
       manifestPath: null,
       org: null,
       authorLogin,
@@ -171,7 +189,7 @@ export async function evaluatePullRequest(gh, repo, pr) {
   if (manifestJson === null) {
     return {
       passed: false,
-      reason: `⚠️ merge-gate: could not read manifest \`${manifestPath}\` at the PR head — refusing to merge.`,
+      reason: `⚠️ merge-gate: could not read manifest \`${sanitizeForComment(manifestPath)}\` at the PR head — refusing to merge.`,
       manifestPath,
       org,
       authorLogin,
@@ -183,7 +201,7 @@ export async function evaluatePullRequest(gh, repo, pr) {
   if (!schemaResult.passed) {
     return {
       passed: false,
-      reason: `🚫 **merge-gate blocked**\n\n${schemaResult.reason}`,
+      reason: `🚫 **merge-gate blocked**\n\n${sanitizeForComment(schemaResult.reason)}`,
       manifestPath,
       org,
       authorLogin,
@@ -210,7 +228,7 @@ export async function evaluatePullRequest(gh, repo, pr) {
   if (typeof declaredNamespace !== "string" || declaredNamespace.toLowerCase() !== `io.github.${org}`) {
     return {
       passed: false,
-      reason: `🚫 **merge-gate blocked**\n\nnamespace: manifest declares \`${String(declaredNamespace)}\` but lives at path \`io.github.${org}/\` — the declared namespace must match the file's path. The CLI derives the path from the namespace by construction; a mismatch indicates a hand-crafted PR attempting namespace impersonation in the index.`,
+      reason: `🚫 **merge-gate blocked**\n\nnamespace: manifest declares \`${sanitizeForComment(declaredNamespace)}\` but lives at path \`io.github.${org}/\` — the declared namespace must match the file's path. The CLI derives the path from the namespace by construction; a mismatch indicates a hand-crafted PR attempting namespace impersonation in the index.`,
       manifestPath,
       org,
       authorLogin,
@@ -245,9 +263,18 @@ export async function evaluatePullRequest(gh, repo, pr) {
     },
   });
   if (!ownershipResult.passed) {
+    // Audit H2: when ownership fails on the ORG-membership path (org ≠ author),
+    // the public_members endpoint can't distinguish a private member from a
+    // non-member. Append the self-serviceable fix so a legitimate but
+    // private-member publisher isn't left guessing. The check function itself
+    // stays generic; only the posted comment carries this product hint.
+    const orgMembershipHint =
+      org.toLowerCase() !== authorLogin.toLowerCase() && /member of org/.test(ownershipResult.reason)
+        ? `\n\nℹ️ Org-namespace publishing checks PUBLIC org membership only. If you are a member of \`${org}\` but your membership is private, the gate can't see it — either make it public (https://github.com/orgs/${org}/people → "Publicize") or publish under your personal namespace \`io.github.${authorLogin.toLowerCase()}\`.`
+        : "";
     return {
       passed: false,
-      reason: `🚫 **merge-gate blocked**\n\n${ownershipResult.reason}`,
+      reason: `🚫 **merge-gate blocked**\n\n${ownershipResult.reason}${orgMembershipHint}`,
       manifestPath,
       org,
       authorLogin,

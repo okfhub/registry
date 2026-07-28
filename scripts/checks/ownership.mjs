@@ -11,8 +11,18 @@
 //      (e.g. io.github.artem-sagaida/foo.json, opened by artem-sagaida.)
 //   2. Org namespace: the author is a confirmed member of the org named in the
 //      path. Membership is checked via an async callback the caller wires to
-//      GET /orgs/{org}/members/{author} (204 = member). The check function
-//      itself never touches the network.
+//      GET /orgs/{org}/public_members/{author} (204 = member). The check
+//      function itself never touches the network.
+//
+//      NOTE (audit H2): public_members only reflects members whose org
+//      membership is set to public — a common privacy setting. A legitimate
+//      private member will get a 404 here and be rejected, indistinguishable
+//      from a non-member. This fails in the SAFE direction (no unauthorized
+//      publish), so it is not a security hole; the self-serviceable fix (make
+//      membership public) is surfaced in the failure comment by the caller in
+//      gate-lib.mjs. Swapping to /members/{author} does not help — the App
+//      installation has no elevated visibility into arbitrary third-party orgs'
+//      private membership.
 //
 // Exact-match only — NEVER prefix. The adversarial matrix in
 // tests/checks/ownership.test.mjs (RESEARCH §4.3) covers prefix, suffix,

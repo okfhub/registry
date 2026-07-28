@@ -21,6 +21,18 @@
 # post-merge registry.json rebuild would never run. The App private key lives
 # as the repo secret OKFHUB_APP_PRIVATE_KEY and is never echoed (no `set -x`).
 #
+# AUDIT M2 (resolved by design): could the default GITHUB_TOKEN (with
+# contents+pull-requests:write) do the merge and drop Administration:write?
+# No. Even setting aside the documented App-bot collaborator-authority 403 on
+# the merge endpoint, merges performed with GITHUB_TOKEN do NOT fire
+# downstream on:push / on:workflow_run events (the "events triggered by the
+# default token don't trigger new workflows" rule). build-registry.yml relies
+# on the push from this merge to rebuild registry.json; a GITHUB_TOKEN merge
+# would merge successfully but silently skip that rebuild — registry.json
+# would drift from the manifests. The App installation token is required to
+# both merge AND propagate the push. This is the load-bearing reason; the
+# Administration:write grant is a separate, documented D-03 deviation.
+#
 # SECURITY: workflow_run checks out trusted code from the default branch, so
 # this always runs THIS workflow file + gate-merge.mjs (not PR-authored code).
 # The merge step re-runs all four checks (defense-in-depth) before merging.
@@ -46,9 +58,17 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions pinned to full commit SHAs (audit M1): this workflow mints the
+      # Administration:write token — the most powerful credential in the system.
+      # A repointed version tag (compromised action/maintainer account) is
+      # catastrophic exactly here. SHA-pinning makes the reference immutable.
+      # merge-gate-check.yml and build-registry.yml stay on tags — they handle
+      # no secret more privileged than the read-only GITHUB_TOKEN / a
+      # website-push PAT, so the ROI there is negligible. Bump by re-resolving
+      # the major tag → SHA via: gh api repos/<owner>/<repo>/git/refs/tags/vN.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
@@ -67,7 +87,7 @@ jobs:
       #     green step proves the token carries these writes.
       - name: Mint App installation token
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
         with:
           app-id: ${{ vars.OKFHUB_APP_ID }}
           private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}

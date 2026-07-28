@@ -36,6 +36,20 @@ test("AUTH-03: bare io.github (no org) → REJECT", () => {
   assert.equal(r.passed, false);
 });
 
+test("AUTH-03 dot-escape: '.' in the regex is LITERAL, not any-char (audit H1)", () => {
+  // If the dots in /^io\.github\./ were ever unescaped, these any-char
+  // stand-ins would slip through the [a-z0-9-]+ segment and validate —
+  // opening the door to namespace strings the rest of the gate assumes are
+  // already ruled out. Each variant swaps a '.' position for a character that
+  // matches [a-z0-9-] but is NOT a literal dot.
+  for (const ns of ["ioXgithubXgoogle", "io9github9google", "io-github-google"]) {
+    const r = checkSchema({ ...VALID, namespace: ns });
+    assert.equal(r.passed, false, `expected '${ns}' to be rejected (dots must be literal)`);
+  }
+  // Sanity: the legitimate form still passes.
+  assert.equal(checkSchema({ ...VALID, namespace: "io.github.google" }).passed, true);
+});
+
 test("missing required field: name → REJECT", () => {
   const { name, ...noName } = VALID;
   void name;
