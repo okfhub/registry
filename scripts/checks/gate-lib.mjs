@@ -192,6 +192,33 @@ export async function evaluatePullRequest(gh, repo, pr) {
     };
   }
 
+  // 1b) NAMESPACE FIELD/PATH CONSISTENCY (defense-in-depth, found by audit).
+  // The ownership check derives the org from the manifest's PATH (org parsed
+  // from io.github.<org>/<name>.json). But build-registry aggregates using the
+  // manifest's namespace FIELD. Without this check, an attacker who owns
+  // io.github.alice/ could publish io.github.alice/bitcoin.json with a manifest
+  // whose namespace FIELD is io.github.google — passing ownership (path=alice)
+  // + schema (field matches the io.github.* regex) but polluting registry.json
+  // with a duplicate {namespace: io.github.google, name: bitcoin}. Install is
+  // not compromised (fetchManifest resolves via the raw PATH + an integrity
+  // check), but the index/listing/search would show the attacker's entry.
+  // Fix: require the manifest's declared namespace to match the path it lives
+  // at, byte-for-byte (both canonical lowercase). The CLI keeps these
+  // consistent by construction (publish.ts derives the path FROM the field);
+  // this blocks hand-crafted PRs.
+  const declaredNamespace = manifestJson.namespace;
+  if (typeof declaredNamespace !== "string" || declaredNamespace.toLowerCase() !== `io.github.${org}`) {
+    return {
+      passed: false,
+      reason: `🚫 **merge-gate blocked**\n\nnamespace: manifest declares \`${String(declaredNamespace)}\` but lives at path \`io.github.${org}/\` — the declared namespace must match the file's path. The CLI derives the path from the namespace by construction; a mismatch indicates a hand-crafted PR attempting namespace impersonation in the index.`,
+      manifestPath,
+      org,
+      authorLogin,
+      headSha,
+      prNumber,
+    };
+  }
+
   // 2) PATH-SCOPE (D-07).
   const pathResult = checkPathScope({ changedFiles, org });
   if (!pathResult.passed) {

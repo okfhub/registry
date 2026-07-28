@@ -107,11 +107,42 @@ async function main() {
       errors.push(`${rel}: ${issues}`);
       continue;
     }
-    bundles.push(result.data);
+    bundles.push({ ...result.data, __path: rel });
   }
 
   if (errors.length > 0) {
     console.error("❌ manifest validation failed:\n" + errors.join("\n"));
+    process.exit(1);
+  }
+
+  // Defense-in-depth (audit finding): reject duplicate namespace+name entries.
+  // The merge-gate now enforces namespace-field===path, but build-registry is
+  // the LAST gate before the index ships — a duplicate here would mean two
+  // files resolve to the same slug in registry.json (index pollution /
+  // install ambiguity). Fail closed: if two manifests declare the same
+  // namespace+name, the build fails rather than emitting a broken index.
+  // Also cross-check that each manifest's declared namespace matches its
+  // directory path (belt-and-braces alongside the gate's check).
+  const seen = new Map(); // `${namespace}/${name}` → path
+  for (const b of bundles) {
+    const key = `${b.namespace}/${b.name}`;
+    // namespace-field/path consistency (the path dir must equal the namespace).
+    const pathOrg = b.__path.match(/^io\.github\.([a-z0-9-]+)\//)?.[1];
+    if (pathOrg && pathOrg !== b.namespace.replace(/^io\.github\./, "")) {
+      errors.push(`${b.__path}: namespace field '${b.namespace}' does not match its directory '${pathOrg}' (namespace/path mismatch).`);
+      continue;
+    }
+    if (seen.has(key)) {
+      errors.push(`${b.__path}: duplicate slug '${key}' (already declared at ${seen.get(key)}). Each namespace+name must be unique.`);
+      continue;
+    }
+    seen.set(key, b.__path);
+  }
+  // Strip the internal __path marker before emitting.
+  for (const b of bundles) delete b.__path;
+
+  if (errors.length > 0) {
+    console.error("❌ registry integrity check failed:\n" + errors.join("\n"));
     process.exit(1);
   }
 
