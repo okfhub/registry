@@ -76,7 +76,13 @@ jobs:
       - name: Compute evidence sidecars
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-          EVIDENCE_MODE: ${{ github.event_name == 'schedule' && 'cron' || 'on-merge' }}
+          # workflow_run (the merge workflow firing) → on-merge path (compute
+          #   the just-merged bundle's sidecar).
+          # schedule (weekly) OR workflow_dispatch (manual recompute) → cron path
+          #   (iterate ALL manifests; smart-recompute). Without routing dispatch
+          #   to cron, a manual trigger ran on-merge mode and found no
+          #   workflow_run event → did nothing.
+          EVIDENCE_MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'cron' || 'on-merge' }}
         run: node scripts/checks/evidence-compute.mjs
 
       # Commit the sidecar(s) with the App token (NOT GITHUB_TOKEN — Pitfall 1).
