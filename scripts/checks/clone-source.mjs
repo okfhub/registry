@@ -99,9 +99,12 @@ function isSafeLinkTarget(extractDir, linkpath) {
 /**
  * Download + extract the public source tarball with system curl + tar, then
  * validate the extracted tree rejects path traversal / symlink escapes. Returns
- * the bundleDir (extractDir/<topDir>/<source.path>).
+ * { extractDir, bundleDir, resolvedRef } — resolvedRef is the short SHA from the
+ * top-dir name (RESEARCH §3.4 Option C), the D-06 snapshot evidence records.
+ *
+ * Exported so evidence-compute.mjs (Plan 04-04) reuses the same hardened clone.
  */
-async function cloneAndExtract(owner, repo, ref, sourcePath) {
+export async function cloneAndExtract(owner, repo, ref, sourcePath) {
   const extractDir = await mkdtemp(join(tmpdir(), "okfhub-clone-"));
   const tarballPath = join(extractDir, "source.tar.gz");
 
@@ -151,7 +154,10 @@ async function cloneAndExtract(owner, repo, ref, sourcePath) {
   } catch {
     throw new Error(`structure: manifest source.path '${sourcePath}' not found in ${owner}/${repo} (ref '${ref}').`);
   }
-  return { extractDir, bundleDir };
+  // The short SHA is the segment after the last '-' in the top-dir name
+  // (RESEARCH §3.4 Option C — <owner>-<repo>-<shortsha>). D-06 resolved_sha.
+  const resolvedRef = topDir.name.slice(topDir.name.lastIndexOf("-") + 1);
+  return { extractDir, bundleDir, resolvedRef };
 }
 
 async function main() {
@@ -189,7 +195,13 @@ async function main() {
   console.log(JSON.stringify({ bundleDir, extractDir }));
 }
 
-main().catch(async (e) => {
-  console.error(`clone-source failed: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+// Run main() ONLY when this file is the entry point (node scripts/checks/clone-source.mjs),
+// NOT when imported as a module (evidence-compute.mjs imports cloneAndExtract).
+import { fileURLToPath as __fileURLToPath } from "node:url";
+const __isMain = process.argv[1] && __fileURLToPath(import.meta.url) === __fileURLToPath(new URL(`file://${process.argv[1]}`));
+if (__isMain) {
+  main().catch(async (e) => {
+    console.error(`clone-source failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}

@@ -57,6 +57,65 @@ const OUTPUT = "registry.json";
 /** Collect every `*.json` under all io.github.* namespace dirs, sorted for
  *  stable output. Reads the top-level entries, filters to dirs matching the
  *  namespace glob, then recursively collects manifests from each. */
+/**
+ * Embed a sidecar's evidence into a validated manifest (D-04). Pure + testable.
+ *
+ * Looks for `io.github.<org>/<name>.evidence.json` beside the manifest. If the
+ * sidecar exists, cross-checks its namespace+name against the manifest's
+ * (T-08-MISMATCH — fail-closed), then returns the manifest with `evidence` set.
+ * If absent, returns the manifest unchanged (the website degrades to "pending"
+ * per Plan 04-02). A malformed sidecar (bad JSON / missing fields) is skipped
+ * with a warning rather than failing the whole build — one bad sidecar must not
+ * block the index.
+ *
+ * @param {object} manifest - the validated manifest (result.data)
+ * @param {string} manifestPath - its repo-relative path (for locating the sidecar + errors)
+ * @param {(p: string) => Promise<string|undefined>} [readFileFn] - injectable read (tests)
+ * @returns {Promise<{bundle: object, warning?: string, mismatch?: true}>}
+ */
+export async function embedEvidence(manifest, manifestPath, readFileFn = safeReadFile) {
+  const sidecarPath = manifestPath.replace(/\.json$/, ".evidence.json");
+  const sidecarText = await readFileFn(sidecarPath);
+  if (sidecarText === undefined) {
+    // No sidecar — backward-compatible: emit the manifest with no evidence field.
+    return { bundle: { ...manifest } };
+  }
+  let sidecar;
+  try {
+    sidecar = JSON.parse(sidecarText);
+  } catch {
+    return {
+      bundle: { ...manifest },
+      warning: `${sidecarPath}: malformed JSON — skipped (bundle stays evidence-pending).`,
+    };
+  }
+  // T-08-MISMATCH: a sidecar placed at the wrong path (namespace impersonation)
+  // fails closed. The aggregator never silently embeds cross-namespace evidence.
+  if (
+    typeof sidecar.namespace !== "string" ||
+    typeof sidecar.name !== "string" ||
+    sidecar.namespace !== manifest.namespace ||
+    sidecar.name !== manifest.name
+  ) {
+    return {
+      bundle: { ...manifest },
+      mismatch: true,
+      warning: `${sidecarPath}: namespace/name mismatch (sidecar ${sidecar.namespace}/${sidecar.name} vs manifest ${manifest.namespace}/${manifest.name}) — NOT embedded.`,
+    };
+  }
+  return { bundle: { ...manifest, evidence: sidecar } };
+}
+
+/** Read a file, returning undefined if it does not exist (non-fatal absence). */
+async function safeReadFile(p) {
+  const { readFile } = await import("node:fs/promises");
+  try {
+    return await readFile(p, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
 async function collectManifests() {
   const top = await readdir(".", { withFileTypes: true });
   const namespaceDirs = top
@@ -107,7 +166,12 @@ async function main() {
       errors.push(`${rel}: ${issues}`);
       continue;
     }
-    bundles.push({ ...result.data, __path: rel });
+    // D-04 (Phase 4): embed the evidence sidecar beside this manifest, if any.
+    // A missing sidecar is non-fatal (backward-compatible); a namespace mismatch
+    // or malformed sidecar emits a warning but keeps the bundle (evidence-pending).
+    const { bundle: bundleObj, warning } = await embedEvidence(result.data, rel);
+    if (warning) console.warn(`⚠️ evidence: ${warning}`);
+    bundles.push({ ...bundleObj, __path: rel });
   }
 
   if (errors.length > 0) {
@@ -162,7 +226,13 @@ async function main() {
   console.log(`✅ aggregated ${bundles.length} bundles → ${OUTPUT}`);
 }
 
-main().catch((e) => {
-  console.error(`❌ build-registry failed: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+// Run main() ONLY when this file is the entry point, not when imported (tests
+// import embedEvidence directly).
+import { fileURLToPath as __fileURLToPath } from "node:url";
+const __isMain = process.argv[1] && __fileURLToPath(import.meta.url) === __fileURLToPath(new URL(`file://${process.argv[1]}`));
+if (__isMain) {
+  main().catch((e) => {
+    console.error(`❌ build-registry failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}
