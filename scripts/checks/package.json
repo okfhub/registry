@@ -5,9 +5,10 @@
   "type": "module",
   "description": "Merge-gate check functions for okfhub/registry publish PRs — pure, testable, zod-backed schema validation.",
   "scripts": {
-    "test": "node --test ../../tests/checks/"
+    "test": "node --test ../../tests/checks/*.test.mjs"
   },
   "dependencies": {
+    "gray-matter": "^4.0.3",
     "zod": "^3.23.8"
   }
 }

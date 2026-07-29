@@ -39,14 +39,33 @@ jobs:
         with:
           node-version: "20"
 
-      # Install the check scripts' zod dep (scripts/checks/package.json).
+      # Install the check scripts' deps (zod + gray-matter for structure.mjs).
       - name: Install check deps
         run: npm ci
         working-directory: scripts/checks
 
-      # Run the four checks with the default GITHUB_TOKEN. No `set -x` — even
-      # though this token is fork-safe, keep the habit of not echoing tokens.
+      # Clone the PR's source bundle for the structural-identity check (#5,
+      # Phase 4 D-02 / VAL-02). Reads the manifest at the PR head, downloads the
+      # public source tarball via GITHUB_TOKEN, validates no path-traversal /
+      # symlink escapes (T-04-PATH / T-04-SYM), and extracts it. The bundleDir is
+      # exported as STRUCTURE_BUNDLE_DIR for the gate-check step. CHECK HALF ONLY
+      # — the merge half (App token) cannot clone arbitrary sources (T-04-SCOPE).
+      # No `set -x` — keep the habit of not echoing tokens.
+      - name: Clone source bundle
+        id: clone-source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUT="$(node scripts/checks/clone-source.mjs)"
+          if [ -n "$OUT" ]; then
+            echo "bundleDir=$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).bundleDir')" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Run the five checks with the default GITHUB_TOKEN. STRUCTURE_BUNDLE_DIR
+      # gates check #5 — present here (check half cloned the source), absent in
+      # the merge half (which trusts this run's conclusion — D-02). No `set -x`.
       - name: Run gate-check
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STRUCTURE_BUNDLE_DIR: ${{ steps.clone-source.outputs.bundleDir }}
         run: node scripts/checks/gate-check.mjs

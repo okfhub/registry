@@ -35,6 +35,7 @@ import { checkSchema } from "./schema.mjs";
 import { checkPathScope, namespaceOrgFromPath } from "./path-scope.mjs";
 import { checkOwnership } from "./ownership.mjs";
 import { checkRateLimit } from "./rate-limit.mjs";
+import { checkStructure } from "./structure.mjs";
 
 const API = process.env.GITHUB_API_URL || "https://api.github.com";
 const POLICY_PATH = process.env.REGISTRY_POLICY_PATH || "registry-policy.json";
@@ -310,6 +311,31 @@ export async function evaluatePullRequest(gh, repo, pr) {
       headSha,
       prNumber,
     };
+  }
+
+  // 5) STRUCTURAL IDENTITY (D-02 / D-08, VAL-02). Runs ONLY in the check half,
+  //    which cloned the PR's source repo and set STRUCTURE_BUNDLE_DIR. The merge
+  //    half re-runs evaluatePullRequest WITHOUT it (the registry-scoped App
+  //    token cannot clone arbitrary github.com/<owner>/<repo> sources — T-04-SCOPE),
+  //    so it TRUSTS this check's success conclusion (D-02 critical invariant).
+  //    When the env var is unset, skip #5 (do not fail) — defense-in-depth for
+  //    checks 1-4 still runs in both halves.
+  if (process.env.STRUCTURE_BUNDLE_DIR) {
+    const structureResult = await checkStructure({
+      manifest: manifestJson,
+      bundleDir: process.env.STRUCTURE_BUNDLE_DIR,
+    });
+    if (!structureResult.passed) {
+      return {
+        passed: false,
+        reason: `🚫 **merge-gate blocked**\n\n${structureResult.reason}`,
+        manifestPath,
+        org,
+        authorLogin,
+        headSha,
+        prNumber,
+      };
+    }
   }
 
   return { passed: true, reason: null, manifestPath, org, authorLogin, headSha, prNumber };
