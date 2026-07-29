@@ -87,6 +87,35 @@ async function collectManifestPaths() {
   return out;
 }
 
+/**
+ * Cron-path targets: each manifest path + its parsed manifest + its prior
+ * sidecar (for D-06 smart recompute). Matches the {manifestPath, manifest,
+ * priorSidecar} shape the on-merge path produces, so the main loop is uniform.
+ */
+async function collectCronTargets() {
+  const paths = await collectManifestPaths();
+  const targets = [];
+  for (const manifestPath of paths) {
+    let manifest;
+    try {
+      manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    } catch {
+      console.error(`⚠️ evidence-compute: ${manifestPath} is not valid JSON — skipping.`);
+      continue;
+    }
+    // Read the prior sidecar (if any) for D-06 smart recompute.
+    const sidecarPath = manifestPath.replace(/\.json$/, ".evidence.json");
+    let priorSidecar;
+    try {
+      priorSidecar = JSON.parse(await readFile(sidecarPath, "utf8"));
+    } catch {
+      priorSidecar = undefined; // no prior sidecar → full recompute
+    }
+    targets.push({ manifestPath, manifest, priorSidecar });
+  }
+  return targets;
+}
+
 /** Sanitize every detail string in a checks array (T-07-INJECT). */
 function sanitizeChecks(checks) {
   return checks.map((c) =>
@@ -170,7 +199,7 @@ async function main() {
   if (!TOKEN) throw new Error("GITHUB_TOKEN not set — evidence-compute needs the App token to clone sources.");
   const { gh } = makeGh(TOKEN);
 
-  const targets = MODE === "cron" ? await collectManifestPaths() : await onMergeTargets(gh);
+  const targets = MODE === "cron" ? await collectCronTargets() : await onMergeTargets(gh);
   if (targets.length === 0) {
     console.log(`evidence-compute (${MODE}): no target manifests — nothing to compute.`);
     return;
