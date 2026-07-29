@@ -1,6 +1,17 @@
-# Build registry.json — validates every manifest and commits the aggregated
-# index cross-repo into okfhub-website/public/registry.json (D-04 one-way
-# contract). Triggered by a manifest push or manually via workflow_dispatch.
+# Build registry.json — validates every manifest, computes structural evidence
+# INLINE (Phase 4 Option A), and commits the aggregated index cross-repo into
+# okfhub-website/public/registry.json (D-04 one-way contract). Triggered by a
+# manifest push, weekly (D-06 decay recompute of source-reachable), or manually.
+#
+# EVIDENCE INLINE (Option A): build-registry.mjs clones each manifest's source
+# and runs verifyBundle, embedding the evidence object directly into registry.json.
+# This replaced the sidecar+separate-workflow design (evidence-compute.yml) after
+# it was proven that protected main rejects the App's direct sidecar push
+# (required_status_checks blocks direct pushes regardless of bypass — verified
+# with classic GH006 and Rulesets GH013). Routing evidence through the
+# registry.json → website channel touches no protected branch. The weekly
+# schedule preserves D-06: source-reachable is decay-able, so evidence is
+# recomputed on a cadence even without a publish.
 #
 # The cross-repo push uses a fine-grained PAT (OKFHUB_WEBSITE_TOKEN, D-05)
 # scoped to asagajda/okfhub-website ONLY — the default GITHUB_TOKEN cannot push
@@ -11,7 +22,18 @@ name: Build registry.json
 on:
   push:
     paths:
-      - "io.github.google/**/*.json"
+      # D-20 fix (Phase 3): single-segment glob matches ANY io.github.<org>
+      # namespace, so external publishes (io.github.stripe/, io.github.<login>/)
+      # trigger the aggregator the same as io.github.google/. Previously this
+      # was `io.github.google/**/*.json` — only the google namespace propagated,
+      # silently dropping every external publish. Do NOT revert to the google-
+      # only filter.
+      - "io.github.*/*.json"
+  schedule:
+    # Weekly, Monday 03:00 UTC — D-06 decay recompute. source-reachable is the
+    # only decay-able evidence check (the content checks are immutable at a
+    # pinned SHA); the weekly run refreshes it without waiting for a publish.
+    - cron: "0 3 * * 1"
   workflow_dispatch: {}
 
 permissions:
@@ -25,8 +47,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+      # Root deps (zod) + checks deps (gray-matter — structure.mjs needs it for
+      # frontmatter parsing). build-registry.mjs imports from scripts/checks/.
       - run: npm ci
+      - run: npm ci
+        working-directory: scripts/checks
+      # GITHUB_TOKEN clones the public source repos for evidence compute (sources
+      # are public; the token avoids rate limits). Same pattern as merge-gate-check.
       - run: node scripts/build-registry.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push registry.json to okfhub-website
         env:

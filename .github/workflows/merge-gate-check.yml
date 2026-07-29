@@ -1,0 +1,71 @@
+# Merge-gate CHECK — runs the four publish-PR checks on a fork PR (no secrets).
+#
+# This is the fork-PR-safe half of the split merge-gate. It runs on
+# pull_request (opened/synchronize/reopened) targeting main, using ONLY the
+# default GITHUB_TOKEN — which is the ONLY token available on a fork PR (repo
+# secrets and variables are withheld in that context). It evaluates schema +
+# path-scope + ownership + rate-limit and exits 0/1 to set a green/red signal.
+#
+# It CANNOT comment or merge (GITHUB_TOKEN lacks those scopes on a fork PR).
+# The downstream merge-gate-merge.yml (on: workflow_run) watches this green
+# signal, then mints the App token (secret available in the default-branch
+# workflow_run context) to merge + post the result comment.
+#
+# SECURITY: this workflow runs untrusted PR content's METADATA only — the
+# gate-check.mjs script fetches the manifest JSON via the GitHub API and
+# validates it with zod. It never executes PR-authored code.
+name: Merge publish PR (check)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read         # read the PR manifest via the Contents API
+  pull-requests: read    # read PR state + changed files
+  # NOTE: deliberately NO write scopes. The fork-PR GITHUB_TOKEN cannot write
+  # anyway; keeping this read-only is defense-in-depth even if GitHub's
+  # behavior changes. Commenting + merging happen in merge-gate-merge.yml.
+
+jobs:
+  check:
+    # Only gate PRs targeting main (publish PRs land on main).
+    if: github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Install the check scripts' deps (zod + gray-matter for structure.mjs).
+      - name: Install check deps
+        run: npm ci
+        working-directory: scripts/checks
+
+      # Clone the PR's source bundle for the structural-identity check (#5,
+      # Phase 4 D-02 / VAL-02). Reads the manifest at the PR head, downloads the
+      # public source tarball via GITHUB_TOKEN, validates no path-traversal /
+      # symlink escapes (T-04-PATH / T-04-SYM), and extracts it. The bundleDir is
+      # exported as STRUCTURE_BUNDLE_DIR for the gate-check step. CHECK HALF ONLY
+      # — the merge half (App token) cannot clone arbitrary sources (T-04-SCOPE).
+      # No `set -x` — keep the habit of not echoing tokens.
+      - name: Clone source bundle
+        id: clone-source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUT="$(node scripts/checks/clone-source.mjs)"
+          if [ -n "$OUT" ]; then
+            echo "bundleDir=$(echo "$OUT" | node -pe 'JSON.parse(require("fs").readFileSync(0,"utf8")).bundleDir')" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Run the five checks with the default GITHUB_TOKEN. STRUCTURE_BUNDLE_DIR
+      # gates check #5 — present here (check half cloned the source), absent in
+      # the merge half (which trusts this run's conclusion — D-02). No `set -x`.
+      - name: Run gate-check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STRUCTURE_BUNDLE_DIR: ${{ steps.clone-source.outputs.bundleDir }}
+        run: node scripts/checks/gate-check.mjs
