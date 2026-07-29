@@ -1,0 +1,7 @@
+{
+  "rate_limits": {
+    "new_namespace_per_day_per_identity": 3,
+    "version_update_per_day_per_identity": 20,
+    "registry_wide_prs_per_hour": 50
+  }
+}

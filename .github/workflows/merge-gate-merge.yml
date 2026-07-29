@@ -1,0 +1,117 @@
+# Merge-gate MERGE — fires after the check workflow completes; mints the App
+# token (secret) and merges all-green PRs. This is the half that NEEDS secrets.
+#
+# WHY on: workflow_run (not pull_request): a workflow triggered by
+# pull_request from a FORK receives only the default GITHUB_TOKEN — repo
+# secrets AND variables are withheld (docs: "secrets are not passed to the
+# runner when a workflow is triggered from a forked repository"). The merge
+# needs the App private key (secret OKFHUB_APP_PRIVATE_KEY) to mint an
+# installation token that can merge AND trigger the downstream
+# build-registry.yml. workflow_run fires in the DEFAULT-BRANCH context, so
+# secrets ARE available. GitHub recommends this pattern specifically for
+# fork-PR + secrets.
+#
+# CHAIN: merge-gate-check.yml (pull_request) → [this] merge-gate-merge.yml
+# (workflow_run). The `workflow_run.head_workflow` filter ensures we only fire
+# after the CHECK workflow, not any other workflow.
+#
+# TOKEN (D-11): the merge uses an App INSTALLATION token minted via
+# actions/create-github-app-token — NOT the default GITHUB_TOKEN. The default
+# token cannot trigger downstream workflows (build-registry.yml), so the
+# post-merge registry.json rebuild would never run. The App private key lives
+# as the repo secret OKFHUB_APP_PRIVATE_KEY and is never echoed (no `set -x`).
+#
+# AUDIT M2 (resolved by design): could the default GITHUB_TOKEN (with
+# contents+pull-requests:write) do the merge and drop Administration:write?
+# No. Even setting aside the documented App-bot collaborator-authority 403 on
+# the merge endpoint, merges performed with GITHUB_TOKEN do NOT fire
+# downstream on:push / on:workflow_run events (the "events triggered by the
+# default token don't trigger new workflows" rule). build-registry.yml relies
+# on the push from this merge to rebuild registry.json; a GITHUB_TOKEN merge
+# would merge successfully but silently skip that rebuild — registry.json
+# would drift from the manifests. The App installation token is required to
+# both merge AND propagate the push. This is the load-bearing reason; the
+# Administration:write grant is a separate, documented D-03 deviation.
+#
+# SECURITY: workflow_run checks out trusted code from the default branch, so
+# this always runs THIS workflow file + gate-merge.mjs (not PR-authored code).
+# The merge step re-runs all four checks (defense-in-depth) before merging.
+name: Merge publish PR (merge)
+
+on:
+  workflow_run:
+    # Only fire after the check workflow completes (success OR failure — we
+    # need to post the failure comment either way). branch-scoped to main.
+    workflows: ["Merge publish PR (check)"]
+    types: [completed]
+
+permissions:
+  contents: write        # the merge push
+  pull-requests: write   # the merge call + result/failure comments
+  actions: read          # read the triggering workflow_run's conclusion
+
+jobs:
+  merge:
+    # Only act when the check workflow COMPLETED. We re-derive pass/fail inside
+    # gate-merge.mjs (do not trust the conclusion blindly), but we skip if the
+    # check workflow itself failed to run (cancelled) — there's nothing to merge.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      # TEMP DIAGNOSTIC: reverted to floating @v4 tags to test whether the
+      # audit-hardening SHA pins (42508e3) broke the App-bot merge (403 since
+      # the pins landed). PR #11 merged fine on @v4; PR #12 403s on the pins.
+      # If @v4 merges, we re-pin to a known-good SHA instead of these.
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install check deps
+        run: npm ci
+        working-directory: scripts/checks
+
+      # Mint an App INSTALLATION token (D-11). inputs:
+      #   app-id      ← OKFHUB_APP_ID repo variable
+      #   private-key ← OKFHUB_APP_PRIVATE_KEY repo secret (the .pem)
+      #   owner + repositories ← scope the token to okfhub/registry only (D-03
+      #                            least-privilege — never "all repos").
+      #   permission-contents / permission-pull-requests ← explicitly request
+      #     the write scopes the merge + comments need. Per the action's docs,
+      #     requesting a permission the install lacks results in an error, so a
+      #     green step proves the token carries these writes.
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OKFHUB_APP_ID }}
+          private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}
+          owner: okfhub
+          repositories: registry
+          permission-contents: write
+          permission-pull-requests: write
+          # Administration:write is REQUIRED for App-bot merges (D-08). Proven
+          # empirically: contents+pull-requests:write alone → merge 403s; adding
+          # administration:write → merge succeeds. GitHub's docs list only
+          # contents:write for the merge endpoint, but that applies to USER
+          # tokens — App-bot tokens hit an undocumented collaborator-authority
+          # check that only administration:write satisfies. Bots can't be added
+          # as collaborators ("not a user") or to teams (422), so there is no
+          # narrower grant. SECURITY tradeoff (accepted, D-03 documented
+          # deviation): administration:write grants repo-deletion + settings +
+          # collaborator + branch-protection control. Mitigations:
+          #   (1) owner+repositories above scopes the token to okfhub/registry
+          #       ONLY — the admin power cannot reach other org repos.
+          #   (2) The token lives only inside this workflow_run job and is
+          #       revoked in the action's post-step (not persistent).
+          #   (3) Branch protection on main requires the merge-gate check
+          #       before merge + restricts direct pushes.
+          permission-administration: write
+
+      # Re-run the checks (defense-in-depth) + merge on all-green. NO `set -x`
+      # — the token must not echo.
+      - name: Run gate-merge
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: node scripts/checks/gate-merge.mjs

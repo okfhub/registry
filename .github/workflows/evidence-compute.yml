@@ -1,0 +1,98 @@
+# Evidence compute — generates structural-conformance evidence sidecars after a
+# publish PR merges, and weekly for the decay-able recompute (Phase 4, D-05).
+#
+# Two triggers (D-05):
+#   workflow_run on "Merge publish PR (merge)" success → on-merge: compute the
+#     full evidence sidecar for the just-merged bundle within minutes.
+#   schedule (weekly, Monday 03:00 UTC) → cron: smart recompute — carry forward
+#     the immutable content-check results, refresh only source-reachable (D-06).
+#
+# TOKEN (T-08-LOOP / Pitfall 1, the load-bearing decision): the sidecar is
+# committed with the App INSTALLATION token — NOT the default GITHUB_TOKEN. A
+# GITHUB_TOKEN push commits but does NOT trigger build-registry.yml's on:push
+# (the "events triggered by the default token don't trigger new workflows"
+# rule), so registry.json would never rebuild and the website would drift. The
+# App token is minted via the SHA-pinned actions/create-github-app-token (same
+# Pattern 3 as merge-gate-merge.yml), scoped to okfhub/registry only.
+#
+# CHAIN: merge-gate-merge.yml (merge) → [this] evidence-compute.yml (sidecar
+# commit) → build-registry.yml (on:push, aggregates evidence into registry.json)
+# → okfhub-website (renders the pill + Evidence tab, Plan 04-02).
+#
+# SECURITY: workflow_run checks out trusted default-branch code. The script
+# clones only PUBLIC source repos and runs verifyBundle (reads markdown only —
+# no eval/exec — T-06-PAWN). No `set -x` — the token must not echo (V8).
+name: Compute evidence sidecars
+
+on:
+  workflow_run:
+    # Fire after the MERGE workflow succeeds (the on-merge path).
+    workflows: ["Merge publish PR (merge)"]
+    types: [completed]
+  schedule:
+    # Weekly, Monday 03:00 UTC — the decay recompute (D-06).
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {} # manual trigger (e.g. first-time backfill)
+
+permissions:
+  contents: write   # commit the sidecar
+  actions: read     # read the triggering workflow_run
+
+jobs:
+  compute:
+    # On-merge path: only when the merge workflow SUCCEEDED (a failed merge
+    # produces nothing to compute). The cron path always runs.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      # SHA-pinned (this workflow mints the App token — audit M1).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "20"
+
+      - name: Install check deps
+        run: npm ci
+        working-directory: scripts/checks
+
+      # Mint the App INSTALLATION token (D-16 / T-08-LOOP). Scoped to
+      # okfhub/registry only (least-privilege — the sidecar commit + source
+      # clone of public repos need only contents:write). Verbatim Pattern 3
+      # from merge-gate-merge.yml (minus administration:write — the evidence
+      # workflow does not merge, so the collaborator-authority grant is unneeded).
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OKFHUB_APP_ID }}
+          private-key: ${{ secrets.OKFHUB_APP_PRIVATE_KEY }}
+          owner: okfhub
+          repositories: registry
+          permission-contents: write
+
+      # Compute the sidecar(s). EVIDENCE_MODE selects on-merge (workflow_run)
+      # vs cron (schedule/dispatch). NO `set -x` — the token must not echo.
+      - name: Compute evidence sidecars
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVIDENCE_MODE: ${{ github.event_name == 'schedule' && 'cron' || 'on-merge' }}
+        run: node scripts/checks/evidence-compute.mjs
+
+      # Commit the sidecar(s) with the App token (NOT GITHUB_TOKEN — Pitfall 1).
+      # The App-token push fires build-registry.yml's on:push naturally, which
+      # rebuilds registry.json and propagates to the website. set -e, NO set -x.
+      - name: Commit sidecars
+        env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -e
+          git config user.name "okfhub-app[bot]"
+          git config user.email "$(printf '%s' "$APP_TOKEN" | cut -c1-0)okfhub-app@users.noreply.github.com"
+          git add 'io.github.*/*.evidence.json' || true
+          if git diff --staged --quiet; then
+            echo "no evidence changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: update evidence sidecars"
+          git push "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
