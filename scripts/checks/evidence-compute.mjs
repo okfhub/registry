@@ -53,23 +53,24 @@ function parseGithubUrl(url) {
 /** Find the manifest path that changed in the workflow_run's triggering merge.
  *  Mirrors gate-merge.mjs's approach to locating the PR for a workflow_run. */
 async function findMergedManifest(gh, workflowRun) {
+  // The workflow_run is triggered by the MERGE workflow's success. Its head_sha
+  // is the squash-merge COMMIT on main (NOT the PR's original head), and its
+  // pull_requests[] is empty — so PR-head matching finds nothing. Instead, read
+  // the merge commit's own file diff: it lists exactly what landed (the manifest).
   const headSha = workflowRun.head_sha;
-  const headBranch = workflowRun.head_branch;
-  const headRepoFullName = workflowRun.head_repository?.full_name;
-  if (!headSha || !headBranch || !headRepoFullName) {
-    throw new Error("evidence-compute: workflow_run missing head_sha/head_branch/head_repository.");
+  if (!headSha) {
+    throw new Error("evidence-compute: workflow_run missing head_sha.");
   }
-  const owner = headRepoFullName.split("/")[0];
-  const res = await gh(`/repos/${REPO}/pulls?state=closed&head=${encodeURIComponent(`${owner}:${headBranch}`)}`);
-  if (!res.ok) throw new Error(`pulls lookup HTTP ${res.status}`);
-  const prs = await res.json();
-  const pr = prs.find((p) => p.head?.sha === headSha && p.base?.ref === "main" && p.merged_at);
-  if (!pr) return null;
-  // List the merge commit's files to find the io.github.*/*.json manifest.
-  const fRes = await gh(`/repos/${REPO}/pulls/${pr.number}/files?per_page=100`);
-  if (!fRes.ok) return null;
-  const files = (await fRes.json()).map((f) => f.filename);
-  return files.find((f) => /^io\.github\.[a-z0-9-]+\/[^/]+\.json$/.test(f)) ?? null;
+  const cRes = await gh(`/repos/${REPO}/commits/${headSha}?per_page=100`);
+  if (!cRes.ok) throw new Error(`commit lookup HTTP ${cRes.status} for ${headSha}`);
+  const commit = await cRes.json();
+  // The merge commit's files: find the added/modified io.github.<org>/<name>.json.
+  // (Excludes *.evidence.json — those are this workflow's output, not manifests.)
+  const manifestFile = (commit.files ?? [])
+    .map((f) => f.filename)
+    .find((f) => /^io\.github\.[a-z0-9-]+\/[^/]+\.json$/.test(f));
+  if (!manifestFile) return null;
+  return manifestFile;
 }
 
 /** Collect every manifest path in the repo (cron path). */

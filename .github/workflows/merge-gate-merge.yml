@@ -58,13 +58,14 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      # TEMP DIAGNOSTIC: reverted to floating @v4 tags to test whether the
-      # audit-hardening SHA pins (42508e3) broke the App-bot merge (403 since
-      # the pins landed). PR #11 merged fine on @v4; PR #12 403s on the pins.
-      # If @v4 merges, we re-pin to a known-good SHA instead of these.
-      - uses: actions/checkout@v4
+      # Actions pinned to full commit SHAs (audit M1): this workflow mints the
+      # App token. SHA-pinning makes the reference immutable. The earlier 403 on
+      # PR #12 was NOT caused by these pins (verified: @v4 reproduced identically)
+      # — it was strict branch protection refusing a behind-branch merge. Bump
+      # by re-resolving the major tag → SHA via: gh api repos/<owner>/<repo>/git/refs/tags/vN.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
 
