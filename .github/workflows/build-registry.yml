@@ -15,8 +15,8 @@
 #
 # The cross-repo push uses a fine-grained PAT (OKFHUB_WEBSITE_TOKEN, D-05)
 # scoped to asagajda/okfhub-website ONLY — the default GITHUB_TOKEN cannot push
-# cross-repo. The push step runs with `set -e` and NO `set -x` so the
-# token-bearing git remote URL is never echoed to the log (RESEARCH §1.2).
+# cross-repo. The push step runs with `set -e` and NEVER echoes commands (no
+# shell tracing) so the token-bearing git remote URL is never logged (RESEARCH §1.2).
 name: Build registry.json
 
 on:
@@ -58,23 +58,37 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push registry.json to okfhub-website
+      - name: Push registry.json + concept bodies to okfhub-website
         env:
           SITE_TOKEN: ${{ secrets.OKFHUB_WEBSITE_TOKEN }}
         run: |
           set -e
           # asagajda/okfhub-website is PRIVATE — both clone and push need the PAT
           # (an unauthenticated clone fails in CI: "could not read Username").
-          # SITE_TOKEN is passed via env, never echoed (no `set -x`).
+          # SITE_TOKEN is passed via env, never echoed (no shell tracing).
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" /tmp/site
           cp registry.json /tmp/site/public/registry.json
+          # Phase 5 (D-04/D-05): also push the materialized concept-body tree.
+          # concepts/ is produced by build-registry.mjs alongside registry.json and
+          # read by the gateway via fs.readFile (the same public/ channel). rsync
+          # --delete prunes concepts removed from a bundle since the last run (a
+          # plain `cp -r` would leave stale bodies). The concepts/ dir is absent
+          # when every bundle failed to clone — guard with the existence check so
+          # the push still ships registry.json alone in that degraded case.
+          if [ -d concepts ]; then
+            mkdir -p /tmp/site/public
+            rsync -a --delete concepts/ /tmp/site/public/concepts/
+          else
+            echo "no concepts/ tree this run (all bundles evidence-pending) — leaving public/concepts as-is"
+          fi
           cd /tmp/site
           git config user.name "okfhub-registry-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add public/registry.json
+          git add public/concepts
           if git diff --staged --quiet; then
-            echo "no change — registry.json already up to date"
+            echo "no change — registry.json + concepts already up to date"
             exit 0
           fi
-          git commit -m "chore: regenerate registry.json [skip ci]"
+          git commit -m "chore: regenerate registry.json + concept bodies [skip ci]"
           git push "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" main

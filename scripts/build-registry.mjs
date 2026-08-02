@@ -26,14 +26,17 @@
 // On any validation error the script exits 1 with a list of the bad files — a
 // publish-time guard so a malformed manifest can never reach the index.
 
-import { readdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 // Evidence pipeline (inline compute — Option A). verifyBundle is the D-03
 // single source of truth; cloneAndExtract is the hardened source fetcher. Both
 // live in scripts/checks/ and are imported here so the aggregator recomputes
 // evidence fresh on every build (no git-tracked sidecar read).
-import { verifyBundle } from "./checks/structure.mjs";
+// PHASE 5: parseBundle is ALSO imported — computeEvidence now materializes
+// concept bodies (D-04) from the SAME walk verifyBundle uses, so evidence and
+// the live read pin to the same resolved_sha (Phase-4 D-06 consistency).
+import { verifyBundle, parseBundle } from "./checks/structure.mjs";
 import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
 
@@ -79,10 +82,36 @@ const OUTPUT = "registry.json";
 const CHECK_LOGIC_VERSION = 1;
 
 /**
+ * Materialize a bundle's concept bodies into artifact records (Phase 5, D-04).
+ * Calls parseBundle (the SAME vendored walk verifyBundle uses) and maps each
+ * concept to `{ relPath, type, body }` where `body` is the raw markdown text
+ * (frontmatter + content) that becomes the MCP `text/markdown` resource (D-05).
+ *
+ * PURE: reads bundleDir only — no network, no eval (T-06-PAWN — text read only).
+ * Symlink concept files are rejected by parseBundle's walkMd (T-04-SYM). A
+ * bundle with zero concepts yields an empty array (never errors). Exported so
+ * the materialization logic is unit-testable without a network clone — mirrors
+ * how verifyBundle/parseBundle are pure exported helpers tested with local dirs.
+ *
+ * @param {string} bundleDir - the extracted bundle root (same dir verifyBundle reads)
+ * @returns {Promise<Array<{relPath: string, type: string, body: string}>>}
+ */
+export async function materializeConcepts(bundleDir) {
+  const { concepts } = await parseBundle(bundleDir);
+  return concepts.map((c) => ({ relPath: c.relPath, type: c.type, body: c.body }));
+}
+
+/**
  * Compute the D-10 evidence object for a manifest INLINE (Option A — no sidecar
  * read). Clones the public source, runs verifyBundle (5 checks), appends
  * source-reachable (the 6th — pass since the tarball GET succeeded), and returns
  * the manifest with `evidence` set + `source` resolved-sha metadata.
+ *
+ * PHASE 5 (D-04): also materializes concept bodies via parseBundle inside the
+ * same try block (after verifyBundle, before the finally cleanup), embedding a
+ * `conceptArtifacts` array on the returned bundle. Because materialization runs
+ * against the SAME extracted bundleDir as verifyBundle, evidence and the live
+ * read are about the SAME pinned resolved_sha (Phase-4 D-06 consistency).
  *
  * Clones only PUBLIC source repos and runs verifyBundle which reads markdown
  * only — never eval/execs bundle files (T-06-PAWN). Every detail string is
@@ -90,26 +119,40 @@ const CHECK_LOGIC_VERSION = 1;
  *
  * @param {object} manifest - the validated manifest (result.data)
  * @param {string} manifestPath - its repo-relative path (for warnings only)
+ * @param {{clone?: Function}} [opts] - optional clone override for unit tests
+ *   (default: the real cloneAndExtract). The override must return
+ *   `{ extractDir, bundleDir, resolvedRef }`. Production always uses the default.
  * @returns {Promise<{bundle: object, warning?: string}>} the manifest with
- *   `evidence` (the D-10 object) and `source` ({resolved_sha}) embedded, or the
- *   bare manifest with a warning if the source clone/verify failed (one bad
- *   bundle must never block the whole index — it stays evidence-pending).
+ *   `evidence` (the D-10 object), `source` ({resolved_sha}), and
+ *   `conceptArtifacts` embedded, or the bare manifest with a warning if the
+ *   source clone/verify failed (one bad bundle must never block the whole index
+ *   — it stays evidence-pending AND concept-pending).
  */
-export async function computeEvidence(manifest, manifestPath) {
+export async function computeEvidence(manifest, manifestPath, opts = {}) {
   if (!manifest.source || manifest.source.type !== "github") {
     return {
       bundle: { ...manifest },
       warning: `${manifestPath}: source type '${manifest.source?.type}' not supported (only 'github') — evidence skipped.`,
     };
   }
+  // Production uses the real hardened clone; tests inject a local-dir resolver
+  // so the success path is unit-testable without a network call (mirrors how the
+  // existing tests cover only the non-network paths of computeEvidence).
+  const clone = opts.clone ?? cloneAndExtract;
   try {
     const { owner, repo } = parseGithubUrl(manifest.source.url);
     const ref = manifest.source.ref ?? "main";
     const sourcePath = manifest.source.path ?? "";
-    const { extractDir, bundleDir, resolvedRef } = await cloneAndExtract(owner, repo, ref, sourcePath);
+    const { extractDir, bundleDir, resolvedRef } = await clone(owner, repo, ref, sourcePath);
     let checks;
+    let conceptArtifacts;
     try {
       checks = (await verifyBundle(bundleDir)).checks;
+      // D-04: materialize concept bodies from the SAME extracted dir, so the
+      // gateway reads the exact pinned snapshot the evidence describes. Runs
+      // AFTER verifyBundle (verify is the identity gate) and BEFORE the finally
+      // rm(extractDir) cleanup — the bodies must be captured before teardown.
+      conceptArtifacts = await materializeConcepts(bundleDir);
     } finally {
       const { rm } = await import("node:fs/promises");
       await rm(extractDir, { recursive: true, force: true });
@@ -129,6 +172,7 @@ export async function computeEvidence(manifest, manifestPath) {
           checks: sanitizeChecks(checks),
         },
         source: { resolved_sha: resolvedRef },
+        conceptArtifacts,
       },
     };
   } catch (e) {
@@ -255,12 +299,47 @@ async function main() {
     `${a.namespace}/${a.name}`.localeCompare(`${b.namespace}/${b.name}`),
   );
 
+  // PHASE 5 (D-04/D-05) — materialize concept bodies to a local concepts/ tree
+  // BEFORE writing registry.json. RESEARCH Pitfall 6: the index must NEVER
+  // advertise a bundle whose body is absent, so bodies are written first; if the
+  // process dies between here and the registry.json write, the worst case is a
+  // stale-but-present concepts/ tree (a re-run self-heals, since the pipeline
+  // recomputes fresh every build — Phase 4 Option A).
+  //
+  // On-disk path mirrors the gateway read path (D-05): the concepts/ tree is
+  // pushed cross-repo to okfhub-website/public/concepts/ and read via fs.readFile.
+  // relPath already carries any subdirectory structure with POSIX slashes.
+  // conceptArtifacts is a TRANSIENT compute-only field — stripped from the bundle
+  // after writing so the bodies are NOT duplicated inside registry.json (the
+  // gateway reads bodies from concepts/, never from the index).
+  const CONCEPTS_DIR = "concepts";
+  let totalMaterialized = 0;
+  for (const b of bundles) {
+    const artifacts = b.conceptArtifacts;
+    if (!artifacts || artifacts.length === 0) continue;
+    for (const { relPath, body } of artifacts) {
+      // relPath is POSIX-normalized relative to bundleDir (from parseBundle's
+      // readdir walk — already validated, no traversal). Join against the
+      // {namespace}/{name} base; mkdir -p semantics create any nested dirs.
+      const outPath = join(CONCEPTS_DIR, b.namespace, b.name, relPath);
+      await mkdir(join(outPath, ".."), { recursive: true });
+      await writeFile(outPath, body, "utf8");
+    }
+    totalMaterialized += artifacts.length;
+    console.log(`✅ materialized ${artifacts.length} concepts for ${b.namespace}/${b.name}`);
+  }
+  // Strip the transient conceptArtifacts payload — bodies live in concepts/, not
+  // in the registry.json index (keeps registry.json lean; the gateway fs.readFile-s).
+  for (const b of bundles) delete b.conceptArtifacts;
+
   const output = {
     generated_at: new Date().toISOString(),
     count: bundles.length,
     bundles,
   };
 
+  // RESEARCH Pitfall 6: registry.json is written AFTER the concepts/ tree above,
+  // so the index never advertises a bundle whose body is missing on disk.
   await writeFile(OUTPUT, JSON.stringify(output, null, 2) + "\n", "utf8");
   console.log(`✅ aggregated ${bundles.length} bundles → ${OUTPUT}`);
 }

@@ -43,8 +43,16 @@ const RESERVED = new Set(["index.md", "log.md"]);
  * (index.md, log.md) are SKIPPED. Collects ALL errors (ERR-03).
  * VENDORED from okfhub-cli/src/lib/okf-parser.ts parseBundle + walkMd.
  *
+ * PHASE 5 EXTENSION (D-04/D-05): each concept now also carries its parsed
+ * `frontmatter` object and the full `body` markdown text (frontmatter + body —
+ * the verbatim `.md` that becomes an MCP resource). The CLI source of truth
+ * (okf-parser.ts) returns `{relPath, frontmatter, type}`; this vendored copy
+ * adds `body` for the materialization pipeline only (the gateway needs the raw
+ * text). Keep the body read here so parseBundle is the single walk of the tree
+ * (no second readdir/readFile pass in computeEvidence).
+ *
  * @param {string} bundleDir
- * @returns {Promise<{concepts: Array<{relPath: string, type: string}>, errors: Array<{file: string, problem: string}>, reservedSkipped: string[]}>}
+ * @returns {Promise<{concepts: Array<{relPath: string, type: string, frontmatter: object, body: string}>, errors: Array<{file: string, problem: string}>, reservedSkipped: string[]}>}
  */
 export async function parseBundle(bundleDir) {
   const concepts = [];
@@ -72,8 +80,11 @@ export async function parseBundle(bundleDir) {
       continue;
     }
 
-    const rawHead = await readFile(abs, "utf8");
-    if (!rawHead.trimStart().startsWith("---")) {
+    // The full markdown text — read ONCE, reused for both the frontmatter-block
+    // check AND the materialized `body` artifact (Phase 5). This is the MCP
+    // resource text (raw .md, D-05). Never eval'd (T-06-PAWN — read as text only).
+    const body = await readFile(abs, "utf8");
+    if (!body.trimStart().startsWith("---")) {
       errors.push({ file: relPath, problem: "missing YAML frontmatter block" });
       continue;
     }
@@ -84,18 +95,36 @@ export async function parseBundle(bundleDir) {
       continue;
     }
 
-    concepts.push({ relPath, type: result.data.type });
+    concepts.push({
+      relPath,
+      type: result.data.type,
+      frontmatter: result.data,
+      body,
+    });
   }
 
   return { concepts, errors, reservedSkipped };
 }
 
-/** Recursively collect all .md files under dir (absolute paths). */
+/**
+ * Recursively collect all .md files under dir (absolute paths).
+ *
+ * PHASE 5 EXTENSION (T-04-SYM): symlink/hardlink entries are SKIPPED, not
+ * followed. OKF bundles are pure markdown; a symlink concept could point
+ * outside the bundle dir (the T-04-SYM threat for materialized artifacts —
+ * fs.readFile on a materialized symlink would escape public/). The clone-time
+ * guard in cloneAndExtract (isSafeEntry) already rejects symlink tar entries;
+ * this walk-time guard is the defense-in-depth backstop for any path that
+ * bypasses tar extraction. Mirrors the Phase-4 isSafeLinkTarget philosophy.
+ */
 async function walkMd(dir) {
   const out = [];
   const entries = await readdir(dir, { withFileTypes: true });
   for (const e of entries) {
     const full = join(dir, e.name);
+    // T-04-SYM: never descend into or collect a symlink/hardlink. dirent-type
+    // checks are race-free vs. lstat reads on macOS/Linux.
+    if (e.isSymbolicLink()) continue;
     if (e.isDirectory()) {
       out.push(...(await walkMd(full)));
     } else if (e.isFile() && e.name.endsWith(".md")) {
