@@ -85,7 +85,18 @@ jobs:
           git config user.name "okfhub-registry-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add public/registry.json
-          git add public/concepts
+          # CR-02: guard the concepts add. When concepts/ was NOT produced this run
+          # AND the freshly-cloned site does not yet contain a public/concepts/ dir
+          # (true on the very first run, and after any run that previously failed
+          # before pushing concepts), an unconditional `git add public/concepts`
+          # errors with "fatal: pathspec 'public/concepts' did not match any files".
+          # Under `set -e` that aborts the whole step, so registry.json is NEVER
+          # committed/pushed — the opposite of the stated invariant ("one bad
+          # bundle never blocks the index"). Guard it so the index ships alone in
+          # the degraded case.
+          if [ -d public/concepts ]; then
+            git add public/concepts
+          fi
           if git diff --staged --quiet; then
             echo "no change — registry.json + concepts already up to date"
             exit 0
