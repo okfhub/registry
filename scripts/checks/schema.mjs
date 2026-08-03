@@ -23,7 +23,10 @@ export const SourceSchema = z.object({
 
 export const ManifestSchema = z.object({
   schema_version: z.literal(1),
-  name: z.string().min(1),
+  // WR-07: constrain name to lowercase-kebab (matches the namespace shape) so a
+  // manifest name with traversal chars (e.g. "../../x") cannot write outside
+  // concepts/ during materialization. Keep in sync with build-registry.mjs + CLI.
+  name: z.string().regex(/^[a-z0-9-]+$/, "name must be lowercase-kebab (a-z, 0-9, -) only"),
   namespace: z.string().regex(/^io\.github\.[a-z0-9-]+$/),
   description: z.string(),
   version: z.string(),

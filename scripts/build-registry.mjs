@@ -56,7 +56,11 @@ export const SourceSchema = z.object({
 
 export const ManifestSchema = z.object({
   schema_version: z.literal(1),
-  name: z.string().min(1),
+  // WR-07: constrain name to the resolver's lowercase-kebab shape. The namespace
+  // is regex-anchored but name was only z.string().min(1), so a manifest name
+  // like "../../public/registry" would let join(CONCEPTS_DIR, ns, name, relPath)
+  // collapse the ".." and write outside concepts/. Mirror the namespace shape.
+  name: z.string().regex(/^[a-z0-9-]+$/, "name must be lowercase-kebab (a-z, 0-9, -) only"),
   namespace: z.string().regex(/^io\.github\.[a-z0-9-]+$/),
   description: z.string(),
   version: z.string(),
