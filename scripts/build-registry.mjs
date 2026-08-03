@@ -334,6 +334,18 @@ async function main() {
   }
   // Strip the transient conceptArtifacts payload — bodies live in concepts/, not
   // in the registry.json index (keeps registry.json lean; the gateway fs.readFile-s).
+  //
+  // WR-08: EXPLICIT contract — bundles WITHOUT conceptArtifacts intentionally
+  // ship INDEX-ONLY. computeEvidence's graceful-degradation path (clone/verify
+  // failure) returns `bundle: { ...manifest }` with NO conceptArtifacts key, and
+  // the write loop above skips them (`if (!artifacts || artifacts.length === 0)
+  // continue`). `delete` on a missing property is a benign no-op, so this second
+  // loop is safe for both shapes. Such bundles are evidence-pending AND
+  // concept-pending: they appear in registry.json (so callers can discover them)
+  // but their concept bodies are NOT in concepts/, so a gateway resources/read
+  // for them 404s via readFile (acceptable — the body was never materialized).
+  // The index and the readable set are kept in lockstep by this skip: a bundle
+  // is only in concepts/ if it reached the success path here.
   for (const b of bundles) delete b.conceptArtifacts;
 
   const output = {
