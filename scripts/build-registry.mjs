@@ -39,6 +39,10 @@ import { z } from "zod";
 import { verifyBundle, parseBundle } from "./checks/structure.mjs";
 import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
+// PHASE 7 (D-02): publisher reputation compute — attached to the bundle as a
+// SIBLING to `evidence` (NOT folded into evidence.checks[]). Computed fresh on
+// every build (D-06); never uses the smartRecompute cron-carry-forward path.
+import { computeReputation } from "./checks/reputation.mjs";
 
 // VENDORED from okfhub-cli/src/lib/manifest.ts — keep in sync (CLI is source of truth).
 // Phase 1 of the manifest schema (ManifestSchema + SourceSchema). Byte-identical
@@ -163,6 +167,23 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
     }
     // The 6th check (source-reachable) — pass since the tarball GET succeeded.
     checks.push({ id: "source-reachable", name: "Source repo reachable", severity: "quality", status: "pass" });
+    // PHASE 7 (D-02/D-06): compute publisher reputation as a sibling step. Runs
+    // AFTER the structural clone+verify succeed, BEFORE the return. Reputation
+    // is independent of the clone (REST /repos + /users + /orgs, not the
+    // extracted tree) and never throws — a fetch failure degrades to pending
+    // (reputation undefined), never aborting the build (the per-bundle catch at
+    // L182-188 still wraps this try block). opts.gh threads through so tests
+    // can inject a mocked fetcher (mirrors the opts.clone override at L145).
+    // priorReputation is undefined here per A-CF (the production path does not
+    // yet wire a prior registry.json cross-repo read; the carry-forward branch
+    // is implemented + unit-tested but ships as transient→pending).
+    const repResult = await computeReputation(manifest, undefined, opts);
+    // Reputation degrade (transient→pending / non-github skip) is non-fatal —
+    // the bundle still ships with evidence intact. Surface the reason to the
+    // build log WITHOUT overriding the evidence-warning contract (the returned
+    // `warning` field means "evidence compute failed"; reputation pending is a
+    // separate, known degradation).
+    if (repResult.warning) console.warn(`⚠️ reputation: ${repResult.warning}`);
     return {
       bundle: {
         ...manifest,
@@ -177,6 +198,7 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
         },
         source: { resolved_sha: resolvedRef },
         conceptArtifacts,
+        reputation: repResult.reputation,
       },
     };
   } catch (e) {
