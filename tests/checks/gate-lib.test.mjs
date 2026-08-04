@@ -13,9 +13,21 @@ import { evaluatePullRequest } from "../../scripts/checks/gate-lib.mjs";
 const REPO = "okfhub/registry";
 
 /** Build a stub gh() that returns canned responses for the API calls
- *  evaluatePullRequest makes: pulls/files, pulls/{n}, contents/{path}. */
-function makeGh({ changedFiles = [], manifestJson = null, manifestPath }) {
+ *  evaluatePullRequest makes: pulls/files, pulls/{n}, contents/{path},
+ *  collaborators/{user}/permission (infra-PR privilege check). */
+function makeGh({ changedFiles = [], manifestJson = null, manifestPath, permission = null }) {
   return async function gh(path, init = {}) {
+    // GET /repos/{repo}/collaborators/{user}/permission — infra-PR gate.
+    // permission: null → 404 (non-collaborator), "admin"/"write"/"triage"/"maintain"
+    // → push true, "read" → push false. Mirrors the real endpoint shape.
+    if (path.includes("/collaborators/") && path.endsWith("/permission")) {
+      if (permission === null) return new Response("not found", { status: 404 });
+      const push = ["admin", "maintain", "write", "triage"].includes(permission);
+      return new Response(
+        JSON.stringify({ permission, permissions: { admin: permission === "admin", maintain: permission === "maintain", push, triage: permission === "triage", pull: true } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
     // GET /repos/{repo}/pulls/{n}/files
     if (path.includes("/files?per_page=100")) {
       return new Response(JSON.stringify(changedFiles.map((f) => ({ filename: f }))), {
@@ -44,6 +56,48 @@ function makeGh({ changedFiles = [], manifestJson = null, manifestPath }) {
     return new Response("{}", { status: 200 });
   };
 }
+
+test("infra PR (no manifest) from a push-permission collaborator → APPROVED, infra: true", async () => {
+  // A maintainer's maintenance PR: scripts/, tests/, .github/ changes, no manifest.
+  // The gate must pass (green check) so the required-status `check` is satisfiable,
+  // and mark infra:true so gate-merge does NOT auto-merge it (human merges).
+  const gh = makeGh({
+    changedFiles: ["scripts/checks/gate-lib.mjs", "tests/checks/gate-lib.test.mjs"],
+    permission: "admin", // maintainer with push permission
+  });
+  const pr = { number: 5, user: { login: "asagajda" }, head: { sha: "mno345" } };
+  const result = await evaluatePullRequest(gh, REPO, pr);
+  assert.equal(result.passed, true, "infra PR from a push collaborator must pass");
+  assert.equal(result.infra, true, "infra PR must be flagged infra:true");
+  assert.equal(result.manifestPath, null);
+});
+
+test("infra PR (no manifest) from a read-only/fork author → BLOCKED (no privilege escalation)", async () => {
+  // A fork/external author's PR touching scripts/ with no manifest must stay RED.
+  // This is the security invariant: a fork cannot auto-merge code into scripts/
+  // or .github/workflows/ via the infra path — only push collaborators can.
+  const gh = makeGh({
+    changedFiles: ["scripts/checks/gate-lib.mjs"],
+    permission: "read", // external contributor, no push permission
+  });
+  const pr = { number: 6, user: { login: "rando" }, head: { sha: "pqr678" } };
+  const result = await evaluatePullRequest(gh, REPO, pr);
+  assert.equal(result.passed, false, "infra PR from a read-only author must be blocked");
+  assert.equal(result.infra, false);
+  assert.match(result.reason, /no .* manifest found/);
+});
+
+test("infra PR from a non-collaborator (404 on permission lookup) → BLOCKED, fail-closed", async () => {
+  // The permission endpoint returns 404 for a user with no explicit collaborator
+  // entry. isMaintainer must fail-closed (treat as not-a-maintainer), not approve.
+  const gh = makeGh({
+    changedFiles: [".github/workflows/build-registry.yml"],
+    permission: null, // 404
+  });
+  const pr = { number: 7, user: { login: "stranger" }, head: { sha: "stu901" } };
+  const result = await evaluatePullRequest(gh, REPO, pr);
+  assert.equal(result.passed, false, "fail-closed on a permission-lookup 404");
+});
 
 test("namespace field/path mismatch → BLOCKED (the exploit this guard prevents)", async () => {
   // The exploit: file at io.github.alice/bitcoin.json, but manifest.namespace = io.github.google.

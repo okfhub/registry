@@ -100,6 +100,22 @@ async function fetchChangedFiles(gh, repo, prNumber) {
   return files.map((f) => f.filename);
 }
 
+/** Does the author have push permission on this repo? (infra-PR gate.)
+ *
+ *  Uses GET /repos/{repo}/collaborators/{username}/permission, which returns
+ *  `{ permission, permissions: { admin, maintain, push, triage, pull } }`.
+ *  `push` is true for admin/maintain/write/triage roles, false for read/none.
+ *  Fail-closed: a non-2xx response (404 for a non-collaborator returns 404 on
+ *  some configs, though the endpoint generally returns the resolved permission)
+ *  is treated as "not a maintainer" so the infra PR stays red rather than
+ *  silently auto-approving on an API hiccup. */
+async function isMaintainer(gh, repo, authorLogin) {
+  const res = await gh(`/repos/${repo}/collaborators/${encodeURIComponent(authorLogin)}/permission`);
+  if (!res.ok) return false;
+  const j = await res.json().catch(() => ({}));
+  return Boolean(j?.permissions?.push);
+}
+
 /** Fetch the manifest JSON a PR publishes (from the head branch), if any. */
 async function fetchManifestAt(gh, repo, prNumber, filePath) {
   const prRes = await gh(`/repos/${repo}/pulls/${prNumber}`);
@@ -149,7 +165,7 @@ async function countRegistryPrsLastHour(gh, repo) {
  * @param {object} gh - fetcher from makeGh(token)
  * @param {string} repo - "okfhub/registry"
  * @param {object} pr - the pull_request object from the event payload
- * @returns {Promise<{passed: boolean, reason: string|null, manifestPath: string|null, org: string|null, authorLogin: string, headSha: string, prNumber: number}>}
+ * @returns {Promise<{passed: boolean, reason: string|null, manifestPath: string|null, org: string|null, authorLogin: string, headSha: string, prNumber: number, infra?: boolean}>}
  */
 export async function evaluatePullRequest(gh, repo, pr) {
   const prNumber = pr.number;
@@ -173,9 +189,35 @@ export async function evaluatePullRequest(gh, repo, pr) {
   // The target manifest = the io.github.<org>/<name>.json the PR publishes.
   const manifestPath = changedFiles.find((f) => /^io\.github\.[a-z0-9-]+\//.test(f));
   if (!manifestPath) {
+    // INFRA PR (no manifest): maintenance changes to scripts/, tests/, .github/,
+    // lib/, docs, etc. These cannot be evaluated by the publish checks (there is
+    // no namespace to own / no source to clone). They pass the gate ONLY when the
+    // PR author is a repo collaborator with push permission — i.e. a trusted
+    // maintainer (admin/maintain/write/triage). A fork/external author's infra PR
+    // stays RED (existing behavior), so no privilege-escalation surface opens:
+    // a fork can't auto-merge code into scripts/ or .github/workflows/.
+    //
+    // The result carries `infra: true` so gate-merge.mjs knows to post a comment
+    // and STOP — it does NOT auto-merge infra PRs (a human merges those). This
+    // keeps the publish-only auto-merge contract intact while letting the
+    // required-status `check` go green for maintainer infra PRs.
+    const infra = await isMaintainer(gh, repo, authorLogin);
+    if (infra) {
+      return {
+        passed: true,
+        infra: true,
+        reason: null,
+        manifestPath: null,
+        org: null,
+        authorLogin,
+        headSha,
+        prNumber,
+      };
+    }
     return {
       passed: false,
-      reason: `⚠️ merge-gate: no \`io.github.<org>/<name>.json\` manifest found among the changed files (${changedFiles.map(sanitizeForComment).join(", ")}). Publish PRs must add exactly one manifest under \`io.github.*\`.`,
+      reason: `⚠️ merge-gate: no \`io.github.<org>/<name>.json\` manifest found among the changed files (${changedFiles.map(sanitizeForComment).join(", ")}). Publish PRs must add exactly one manifest under \`io.github.*\`; infra PRs (no manifest) must come from a collaborator with write permission.`,
+      infra: false,
       manifestPath: null,
       org: null,
       authorLogin,

@@ -112,7 +112,24 @@ async function main() {
     process.exit(1);
   }
 
-  // ALL GREEN — merge via the App installation token (D-08 / AUTH-04).
+  // INFRA PR (no manifest, authored by a push-permission collaborator): the
+  // gate approved the author, but we do NOT auto-merge maintenance changes — a
+  // human merges those. Post a comment so the PR is not silent, and exit 0 (the
+  // required `check` status stays green; the ruleset's required check is then
+  // satisfiable, but the human-controlled merge step is the actual landing).
+  // This keeps the publish-only auto-merge contract intact.
+  if (result.infra) {
+    await postComment(
+      gh,
+      REPO,
+      prNumber,
+      `✅ **merge-gate: approved (infra PR)** — author \`${result.authorLogin}\` has push permission; no manifest to gate. A maintainer merges this. (Publish PRs auto-merge; infra PRs are human-merged by design.)`,
+    );
+    console.log(`gate-merge: PR #${prNumber} is an approved infra PR — comment posted, NOT auto-merged.`);
+    return;
+  }
+
+  // ALL GREEN — publish PR, merge via the App installation token (D-08 / AUTH-04).
   const commitTitle = `${result.manifestPath} (auto-merge by okfhub merge-gate)`;
   const mergeRes = await mergePr(gh, REPO, prNumber, result.headSha, commitTitle);
   if (mergeRes.status === 409) {
