@@ -18,8 +18,6 @@ const REPO = "okfhub/registry";
 function makeGh({ changedFiles = [], manifestJson = null, manifestPath, permission = null }) {
   return async function gh(path, init = {}) {
     // GET /repos/{repo}/collaborators/{user}/permission — infra-PR gate.
-    // permission: null → 404 (non-collaborator), "admin"/"write"/"triage"/"maintain"
-    // → push true, "read" → push false. Mirrors the real endpoint shape.
     if (path.includes("/collaborators/") && path.endsWith("/permission")) {
       if (permission === null) return new Response("not found", { status: 404 });
       const push = ["admin", "maintain", "write", "triage"].includes(permission);
@@ -54,6 +52,21 @@ function makeGh({ changedFiles = [], manifestJson = null, manifestPath, permissi
       );
     }
     return new Response("{}", { status: 200 });
+  };
+}
+
+/** A valid io.http.* manifest fixture (Phase 8). */
+function httpManifest(over = {}) {
+  return {
+    schema_version: 1,
+    name: "my-http-bundle",
+    namespace: "io.http.example.com",
+    description: "http-sourced",
+    version: "1.0.0",
+    source: { type: "http", url: "https://example.com/bundles/my-http-bundle.tar.gz" },
+    kind: "knowledge",
+    categories: [],
+    ...over,
   };
 }
 
@@ -191,4 +204,181 @@ test("namespace field case mismatch (io.github.Alice vs path io.github.alice) �
   // blocked at schema. This test documents that case tricks are caught (by
   // schema here); the namespace guard is the backstop for regex-valid cases.
   assert.equal(result.passed, false);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 8: io.http.* namespace-family dispatch + DNS-ownership check.
+// The gate's io.http.* branch re-derives the deterministic token, queries the
+// authoritative NS via an injected verifyChallenge, and passes only if the TXT
+// matches. Fail-closed on a thrown resolver / NXDOMAIN-within-window (T-08-GATE).
+// The github org-membership path is UNCHANGED (the earlier tests cover it).
+// ---------------------------------------------------------------------------
+
+test("io.http.* PR with a matching DNS TXT → APPROVED (DNS-ownership proven)", async () => {
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/my-http-bundle.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 10, user: { login: "anyone" }, head: { sha: "http01" } };
+  // Inject verifyDns → returns true (TXT present on the authoritative NS).
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    verifyDns: async () => true,
+    dnsRetryInterval: 0,
+    dnsRetryBudget: 0,
+  });
+  assert.equal(result.passed, true, "http PR with a matching TXT must pass");
+  assert.equal(result.org, null); // org is null for http (no github org)
+});
+
+test("io.http.* PR with verifyDns returning false (TXT absent) → BLOCKED", async () => {
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/my-http-bundle.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 11, user: { login: "anyone" }, head: { sha: "http02" } };
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    verifyDns: async () => false, // TXT not present on the authoritative NS
+    dnsRetryInterval: 0,
+    dnsRetryBudget: 0, // single shot — no retry wait
+  });
+  assert.equal(result.passed, false);
+  assert.match(result.reason, /DNS TXT challenge NOT verified/);
+});
+
+test("io.http.* PR with a THROWN resolver (resolver error) → BLOCKED, fail-closed (T-08-GATE)", async () => {
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/my-http-bundle.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 12, user: { login: "anyone" }, head: { sha: "http03" } };
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    verifyDns: async () => {
+      throw new Error("EAI_AGAIN resolver timeout");
+    },
+    dnsRetryInterval: 0,
+    dnsRetryBudget: 0,
+  });
+  assert.equal(result.passed, false, "a thrown resolver must fail-closed (block)");
+  assert.match(result.reason, /failing safe/);
+});
+
+test("io.http.* namespace field/path mismatch → BLOCKED (T-08-CONSISTENCY)", async () => {
+  // Manifest namespace field claims a different http domain than its path.
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/spoof.json"],
+    manifestJson: httpManifest({ namespace: "io.http.evil.com", name: "spoof" }),
+  });
+  const pr = { number: 13, user: { login: "anyone" }, head: { sha: "http04" } };
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    verifyDns: async () => true,
+    dnsRetryInterval: 0,
+    dnsRetryBudget: 0,
+  });
+  assert.equal(result.passed, false);
+  assert.match(result.reason, /namespace.*declares.*io\.http\.evil\.com.*but lives at.*io\.http\.example\.com/);
+});
+
+test("io.http.* PR with a github-namespaced file mixed in → BLOCKED at path-scope (cross-namespace)", async () => {
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/a.json", "io.github.alice/b.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 14, user: { login: "anyone" }, head: { sha: "http05" } };
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    verifyDns: async () => true,
+    dnsRetryInterval: 0,
+    dnsRetryBudget: 0,
+  });
+  assert.equal(result.passed, false);
+  assert.match(result.reason, /path-scope/);
+  assert.match(result.reason, /cross-namespace/);
+});
+
+test("io.http.* gate re-derives the SAME token the publish CLI computes (challengeRecordName)", async () => {
+  // The gate's http branch calls challengeRecordName(namespace, name, sourceUrl, domain).
+  // This test confirms the gate threaded those exact fields to the verifier by
+  // asserting the recordName + expectedValue the injected verifyDns received
+  // match the deterministic token for this manifest.
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/my-http-bundle.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 15, user: { login: "anyone" }, head: { sha: "http06" } };
+  let seen = null;
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    verifyDns: async (recordName, domain, expectedValue) => {
+      seen = { recordName, domain, expectedValue };
+      return true;
+    },
+    dnsRetryInterval: 0,
+    dnsRetryBudget: 0,
+  });
+  assert.equal(result.passed, true);
+  assert.ok(seen, "verifyDns was called");
+  // The expectedValue is the deterministic okfhub-verify=<namespace>/<name>.
+  assert.equal(seen.expectedValue, "okfhub-verify=io.http.example.com/my-http-bundle");
+  assert.equal(seen.domain, "example.com");
+  // The recordName matches dns-verify.mjs's challengeRecordName byte-for-byte.
+  const { challengeRecordName } = await import("../../scripts/checks/dns-verify.mjs");
+  const expectedName = challengeRecordName(
+    "io.http.example.com",
+    "my-http-bundle",
+    "https://example.com/bundles/my-http-bundle.tar.gz",
+    "example.com",
+  );
+  assert.equal(seen.recordName, expectedName);
+});
+
+test("io.http.* propagation-retry loop: TXT appears on the 3rd attempt → pass (within budget)", async () => {
+  // The propagation-retry loop retries every interval until the budget. A TXT
+  // that appears after 2 misses + 1 hit passes (simulates a publisher who added
+  // the TXT just before the gate ran). Interval/budget overridden to keep the
+  // test fast.
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/my-http-bundle.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 16, user: { login: "anyone" }, head: { sha: "http07" } };
+  let calls = 0;
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    // Override the REAL verifier (not opts.verifyDns) — exercise verifyDnsWithRetry.
+    dnsRetryInterval: 1, // 1ms — effectively immediate
+    dnsRetryBudget: 5000, // 5s budget — enough for a few 1ms retries
+    // Stub the real resolver used by verifyDnsChallenge. opts.verifyDns short-
+    // circuits the retry loop, so we inject at the resolver level to exercise it.
+    resolver: {
+      resolveNs: async () => ["ns1.example.com"],
+      resolve4: async () => ["1.2.3.4"],
+      setServers: () => {},
+      resolveTxt: async () => {
+        calls += 1;
+        if (calls < 3) throw new Error("ENOTFOUND"); // first 2 attempts: not present
+        return [["okfhub-verify=io.http.example.com/my-http-bundle"]]; // 3rd: present
+      },
+    },
+  });
+  assert.equal(result.passed, true, "TXT appearing on the 3rd attempt passes within the budget");
+  assert.ok(calls >= 3, `the retry loop made multiple attempts (saw ${calls})`);
+});
+
+test("io.http.* propagation-retry loop: TXT never appears within budget → BLOCKED", async () => {
+  const gh = makeGh({
+    changedFiles: ["io.http.example.com/my-http-bundle.json"],
+    manifestJson: httpManifest(),
+  });
+  const pr = { number: 17, user: { login: "anyone" }, head: { sha: "http08" } };
+  const result = await evaluatePullRequest(gh, REPO, pr, {
+    dnsRetryInterval: 1,
+    dnsRetryBudget: 5, // 5ms budget — exhausted quickly, TXT never appears
+    resolver: {
+      resolveNs: async () => ["ns1.example.com"],
+      resolve4: async () => ["1.2.3.4"],
+      setServers: () => {},
+      resolveTxt: async () => {
+        throw new Error("ENOTFOUND"); // never present
+      },
+    },
+  });
+  assert.equal(result.passed, false);
+  assert.match(result.reason, /DNS TXT challenge NOT verified/);
 });

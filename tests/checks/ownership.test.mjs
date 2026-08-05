@@ -3,7 +3,7 @@
 // spoof / collision attack the exact-match check MUST reject.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkOwnership } from "../../scripts/checks/ownership.mjs";
+import { checkOwnership, checkDnsOwnership } from "../../scripts/checks/ownership.mjs";
 
 // Helper: an isOrgMember stub that returns true only for the given (org,user) pair.
 const memberOf = (org, user) => async (o, u) => o === org && u === user;
@@ -145,4 +145,77 @@ test("default isOrgMember (omitted) → fails safe (never grants)", async () => 
     // no isOrgMember → default rejects
   });
   assert.equal(r.passed, false);
+});
+
+// ---------------------------------------------------------------------------
+// checkDnsOwnership — the io.http.* DNS-ownership check (Phase 8, HTTP-02).
+// Mirrors checkOwnership's injection pattern (verifyChallenge callback) +
+// fail-safe discipline. Every row is a pass/fail/fail-safe case the gate relies
+// on (T-08-GATE fail-closed on NXDOMAIN-within-window + resolver error).
+// ---------------------------------------------------------------------------
+
+test("DNS ownership: verifyChallenge returns true → pass", async () => {
+  const r = await checkDnsOwnership({
+    domain: "example.com",
+    recordName: "_okfhub.deadbeef.example.com",
+    expectedValue: "okfhub-verify=io.http.example.com/my-bundle",
+    verifyChallenge: async () => true,
+  });
+  assert.equal(r.passed, true);
+  assert.match(r.reason, /DNS TXT challenge verified/);
+});
+
+test("DNS ownership: verifyChallenge returns false (TXT not present) → BLOCK", async () => {
+  const r = await checkDnsOwnership({
+    domain: "example.com",
+    recordName: "_okfhub.deadbeef.example.com",
+    expectedValue: "okfhub-verify=io.http.example.com/my-bundle",
+    verifyChallenge: async () => false,
+  });
+  assert.equal(r.passed, false);
+  assert.match(r.reason, /NOT verified/);
+});
+
+test("DNS ownership: verifyChallenge THROWS (resolver error) → fail safe (BLOCK)", async () => {
+  const r = await checkDnsOwnership({
+    domain: "example.com",
+    recordName: "_okfhub.deadbeef.example.com",
+    expectedValue: "okfhub-verify=io.http.example.com/my-bundle",
+    verifyChallenge: async () => {
+      throw new Error("ECONNREFUSED");
+    },
+  });
+  assert.equal(r.passed, false);
+  assert.match(r.reason, /failing safe/);
+});
+
+test("DNS ownership: empty input → fail safe (BLOCK)", async () => {
+  const r = await checkDnsOwnership({
+    domain: "",
+    recordName: "_okfhub.deadbeef.example.com",
+    expectedValue: "okfhub-verify=io.http.example.com/my-bundle",
+    verifyChallenge: async () => true,
+  });
+  assert.equal(r.passed, false);
+  assert.match(r.reason, /empty DNS-challenge input/);
+});
+
+test("DNS ownership: default verifyChallenge (omitted) → fails safe (never grants)", async () => {
+  const r = await checkDnsOwnership({
+    domain: "example.com",
+    recordName: "_okfhub.deadbeef.example.com",
+    expectedValue: "okfhub-verify=io.http.example.com/my-bundle",
+    // no verifyChallenge → default rejects (never true)
+  });
+  assert.equal(r.passed, false);
+});
+
+test("DNS ownership: the function signature is the DNS analog (no isOrgMember / no body)", () => {
+  // Static shape check: checkDnsOwnership takes { domain, recordName,
+  // expectedValue, verifyChallenge } — no org-membership, no PR body. Mirrors
+  // the checkOwnership D-05 shape assertion.
+  assert.equal(checkDnsOwnership.length, 1, "checkDnsOwnership takes a single args object");
+  const src = String(checkDnsOwnership);
+  assert.doesNotMatch(src, /isOrgMember|prBody|pr_body|\bbody\b/);
+  assert.match(src, /verifyChallenge/);
 });

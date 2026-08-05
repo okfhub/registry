@@ -83,3 +83,77 @@ export async function checkOwnership({ org, authorLogin, isOrgMember }) {
     reason: `ownership: '${a}' is neither the owner of personal namespace '${o}' nor a member of org '${o}' (exact-match only; seen='${a}' expected='${o}').`,
   };
 }
+
+/**
+ * @typedef {(recordName: string, domain: string, expectedValue: string) => Promise<boolean>} VerifyChallenge
+ */
+
+/**
+ * DNS-ownership check for io.http.<domain> publish PRs (Phase 8, HTTP-02).
+ *
+ * THE LOAD-BEARING SECURITY INVARIANT (T-08-GATE): an io.http.* PR's ownership
+ * is proven by a DNS TXT challenge, NOT org-membership. The caller injects a
+ * `verifyChallenge(recordName, domain, expectedValue)` callback that re-derives
+ * the deterministic token (via challengeRecordName) and queries the
+ * authoritative NS (via verifyDnsChallenge). This keeps this function pure (no
+ * network) and mirrors checkOwnership's isOrgMember injection pattern.
+ *
+ * Fail-closed (D-12 no-silent-failure): a THROWN verifyChallenge callback
+ * (resolver error, NXDOMAIN) → BLOCK. A returned `false` (TXT not yet present)
+ * → BLOCK. Only a returned `true` (the TXT matches) → PASS. This is the gate's
+ * half of the DNS challenge — the build-time half lives in dnsVerify
+ * (computeEvidence); the gate is the merge-decision half.
+ *
+ * The expectedValue is the deterministic `okfhub-verify=<namespace>/<name>`
+ * string — the caller computes recordName via challengeRecordName so the
+ * publish CLI and the gate re-derive byte-identical values (D-01 — no issuance
+ * server). This function only decides pass/fail from the callback's boolean.
+ *
+ * @param {object} args
+ * @param {string} args.domain         The <domain> from io.http.<domain> (the segment whose authoritative NS is queried).
+ * @param {string} args.recordName     The deterministic _okfhub.<token8>.<domain> TXT name (caller-derived via challengeRecordName).
+ * @param {string} args.expectedValue  The okfhub-verify=<namespace>/<name> TXT value the record must carry.
+ * @param {VerifyChallenge} [args.verifyChallenge] Async callback returning true iff the authoritative NS serves expectedValue at recordName. Default rejects (never-true) so tests that forget to wire it fail safe.
+ * @returns {Promise<{passed: boolean, reason: string}>}
+ */
+export async function checkDnsOwnership({ domain, recordName, expectedValue, verifyChallenge }) {
+  const d = String(domain ?? "").trim();
+  const rn = String(recordName ?? "").trim();
+  const ev = String(expectedValue ?? "").trim();
+
+  if (d.length === 0 || rn.length === 0 || ev.length === 0) {
+    return {
+      passed: false,
+      reason: `ownership: empty DNS-challenge input — domain='${d}' recordName='${rn}' expectedValue='${ev}' (all required).`,
+    };
+  }
+
+  const checker = verifyChallenge ?? (async () => false);
+  let ok = false;
+  try {
+    ok = await checker(rn, d, ev);
+  } catch (e) {
+    // A resolver error / NXDOMAIN within the window fails SAFE — never grant
+    // ownership on an unresolved DNS query (D-12 no-silent-failure, T-08-GATE
+    // fail-closed). The gate's retry loop (in the caller, around the real
+    // verifyDnsChallenge) bounds how long we tolerate "not yet present"; once
+    // the loop exhausts, this thrown callback path is the fail-closed gate.
+    const why = e instanceof Error ? e.message : String(e);
+    return {
+      passed: false,
+      reason: `ownership: DNS challenge lookup for '${rn}' (domain '${d}') failed — failing safe (${why}).`,
+    };
+  }
+
+  if (ok) {
+    return {
+      passed: true,
+      reason: `ownership: DNS TXT challenge verified for domain '${d}' at '${rn}'.`,
+    };
+  }
+
+  return {
+    passed: false,
+    reason: `ownership: DNS TXT challenge NOT verified for domain '${d}' — the expected TXT record at '${rn}' was not found on the authoritative NS within the verification window. Add the TXT record and re-run the gate.`,
+  };
+}
