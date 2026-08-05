@@ -49,7 +49,7 @@ import { computeReputation } from "./checks/reputation.mjs";
 // field list + constraints so the registry, the CLI, and the website all bind to
 // one contract.
 
-export const SourceType = z.enum(["github", "git", "tarball"]);
+export const SourceType = z.enum(["github", "git", "tarball", "http"]);
 
 export const SourceSchema = z.object({
   type: SourceType,
@@ -65,7 +65,7 @@ export const ManifestSchema = z.object({
   // like "../../public/registry" would let join(CONCEPTS_DIR, ns, name, relPath)
   // collapse the ".." and write outside concepts/. Mirror the namespace shape.
   name: z.string().regex(/^[a-z0-9-]+$/, "name must be lowercase-kebab (a-z, 0-9, -) only"),
-  namespace: z.string().regex(/^io\.github\.[a-z0-9-]+$/),
+  namespace: z.string().regex(/^io\.(github|http)\.[a-z0-9.-]+$/),
   description: z.string(),
   version: z.string(),
   source: SourceSchema,
@@ -81,8 +81,8 @@ export const ManifestSchema = z.object({
 // build — but if the aggregator only reads io.github.google/, external
 // manifests trigger a build that then ignores them. Phase 3's self-publishing
 // feature relies on this being consistent: trigger + discovery must cover the
-// same set of namespaces.
-const NAMESPACE_GLOB = "io.github.*";
+// same set of namespaces. Phase 8 adds io.http.<domain>/ (HTTP-served bundles).
+const NAMESPACE_GLOBS = ["io.github.*", "io.http.*"];
 const OUTPUT = "registry.json";
 
 // Bump whenever a check's logic changes — recorded in each evidence object so a
@@ -230,9 +230,10 @@ async function collectManifests() {
     .filter((e) => e.isDirectory())
     .map((e) => e.name)
     .filter((name) => {
-      // Match io.github.<lowercase-identifier> — the namespace pattern the
-      // manifest schema enforces (manifest.namespace regex).
-      return /^io\.github\.[a-z0-9-]+$/.test(name);
+      // Match io.(github|http).<segment> — the namespace pattern the manifest
+      // schema enforces (manifest.namespace regex). The http segment allows
+      // dots+hyphens because it is a domain (e.g. io.http.example.com).
+      return /^io\.(github|http)\.[a-z0-9.-]+$/.test(name);
     })
     .sort();
   const allFiles = [];

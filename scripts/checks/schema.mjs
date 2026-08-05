@@ -7,12 +7,14 @@
 // sync with okfhub-cli/src/lib/manifest.ts AND scripts/build-registry.mjs.
 //
 // AUTH-03 (v1): namespaces constrained to io.github.* only, enforced by the
-// namespace regex. The merge-gate runs this BEFORE ownership/path-scope so a
-// non-io.github.* manifest is rejected at schema parse.
+// namespace regex. Phase 8 widens to io.(github|http).<segment> — the http
+// family allows dots+hyphens because the segment is a domain. The merge-gate
+// runs this BEFORE ownership/path-scope so a non-conforming manifest is
+// rejected at schema parse.
 
 import { z } from "zod";
 
-export const SourceType = z.enum(["github", "git", "tarball"]);
+export const SourceType = z.enum(["github", "git", "tarball", "http"]);
 
 export const SourceSchema = z.object({
   type: SourceType,
@@ -27,7 +29,7 @@ export const ManifestSchema = z.object({
   // manifest name with traversal chars (e.g. "../../x") cannot write outside
   // concepts/ during materialization. Keep in sync with build-registry.mjs + CLI.
   name: z.string().regex(/^[a-z0-9-]+$/, "name must be lowercase-kebab (a-z, 0-9, -) only"),
-  namespace: z.string().regex(/^io\.github\.[a-z0-9-]+$/),
+  namespace: z.string().regex(/^io\.(github|http)\.[a-z0-9.-]+$/),
   description: z.string(),
   version: z.string(),
   source: SourceSchema,
