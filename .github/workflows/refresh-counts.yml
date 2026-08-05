@@ -1,0 +1,74 @@
+# Refresh telemetry counts (Plan 09-03, D-03) — the lightweight 4×/day count read-back.
+#
+# This is a SIBLING workflow (not a new job in build-registry.yml) so a telemetry-only
+# failure is isolated from the main evidence/materialize/reputation build. It deliberately
+# does the LEAST work possible: one Upstash HGETALL × 3 buckets → one counts.json write →
+# one cross-repo push. NO re-clone, NO evidence/materialize/reputation recompute (D-03 —
+# the heavyweight build stays on its push + weekly cadence; mutating registry.json 4×/day
+# would churn git history and trigger full Vercel rebuilds).
+#
+# Counts are ≤6h stale (cron "0 0,6,12,18 * * *" = 4×/day); the UI frames them honestly
+# "updated every 6h · opt-out; actual may be higher".
+#
+# The refresh script (scripts/refresh-counts.mjs) uses ZERO npm packages — plain fetch()
+# to the Upstash REST HTTP API (no Upstash Redis SDK, no `npm ci` step) so registry-repo
+# gains ZERO new dependencies (T-09-SC, option (b) over adding the SDK). It needs
+# only Node's global fetch + node:fs, both builtins on the setup-node@v4 node-20 runner.
+#
+# Cross-repo push reuses the SAME trusted channel as build-registry.yml: the
+# OKFHUB_WEBSITE_TOKEN PAT, `set -e`, the bot identity, a [skip ci] commit, the
+# no-change guard, and NEVER echoes the token-bearing git URL (no shell tracing).
+name: Refresh telemetry counts
+
+on:
+  schedule:
+    # 4×/day at 00:00, 06:00, 12:00, 18:00 UTC → ≤6h staleness (D-03). Claude's-Discretion
+    # picked the explicit `0 0,6,12,18 * * *` form over `0 */6 * * *` for greppability.
+    - cron: "0 0,6,12,18 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # NO `npm ci` / `npm install` step — refresh-counts.mjs is dependency-free (uses only
+      # Node's global fetch + node:fs builtins; registry-repo's only declared dep `zod` is
+      # not needed by this script). Adding an install step would also risk pulling in an
+      # untracked dependency; the zero-install discipline is part of T-09-SC.
+      - name: Read counts from Upstash → counts.json
+        env:
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: node scripts/refresh-counts.mjs
+
+      - name: Cross-repo push counts.json to okfhub-website
+        env:
+          SITE_TOKEN: ${{ secrets.OKFHUB_WEBSITE_TOKEN }}
+        run: |
+          set -e
+          # asagajda/okfhub-website is PRIVATE — both clone and push need the PAT. SITE_TOKEN
+          # is passed via env, NEVER echoed (no `set -x` / shell tracing) so the token-bearing
+          # git remote URL is never logged (RESEARCH §1.2, T-09-16). Same discipline as
+          # build-registry.yml's push step.
+          git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" /tmp/site
+          mkdir -p /tmp/site/public
+          cp counts.json /tmp/site/public/counts.json
+          cd /tmp/site
+          git config user.name "okfhub-registry-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/counts.json
+          # No-change guard: if counts.json did not change since the last tick (no new
+          # pings in the window), exit cleanly without a noise commit.
+          if git diff --staged --quiet; then
+            echo "no change — counts.json already up to date"
+            exit 0
+          fi
+          git commit -m "chore: refresh telemetry counts [skip ci]"
+          git push "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" main
