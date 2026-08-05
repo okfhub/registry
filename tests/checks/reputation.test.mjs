@@ -254,3 +254,88 @@ test("network error on /repos → transient → pending", async () => {
   assert.equal(reputation, undefined);
   assert.ok(warning);
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8 (Plan 08-03 Task 1) — the computeReputation http branch (HTTP-03).
+//
+// An io.http.* bundle has NO GitHub org, so the http branch NEVER emits
+// verified-org or host-popularity (D-07 — DNS never reaches the GitHub-verified
+// tier). Instead it reads the threaded dnsVerify result (opts.dnsResult) and
+// emits exactly one dated-factual signal:
+//   - dns-verified-domain → "DNS TXT challenge passed for <domain> on <date>."
+//   - dns-stale           → "DNS verification stale (last passed <date>); re-challenge pending."
+//   - dns-pending         → reputation-pending "DNS verification pending."
+// Every detail is dated factual copy, NEVER a verdict (D-07/D-08).
+// ---------------------------------------------------------------------------
+
+/** An http-sourced manifest fixture (io.http.<domain> namespace). */
+const HTTP_MANIFEST = {
+  schema_version: 1,
+  name: "ga4-ecommerce",
+  namespace: "io.http.example.com",
+  description: "test",
+  version: "1.0.0",
+  source: { type: "http", url: "https://example.com/bundle.tar.gz", path: "", ref: "" },
+  kind: "knowledge",
+  categories: [],
+};
+
+test("http source: dns-verified-domain → dns-verified-domain signal with dated factual detail (D-07)", async () => {
+  const dnsResult = {
+    state: "dns-verified-domain",
+    dns_verified_at: "2026-08-05T00:00:00.000Z",
+    token: "io.http.example.com/ga4-ecommerce",
+  };
+  const { reputation, warning } = await computeReputation(HTTP_MANIFEST, undefined, { dnsResult });
+  assert.equal(warning, undefined, "no warning on the http success path");
+  assert.ok(reputation, "reputation block present (http branch)");
+  assert.equal(reputation.source_type, "http");
+  const dns = reputation.signals.find((s) => s.kind === "dns-verified-domain");
+  assert.ok(dns, "dns-verified-domain signal present");
+  assert.equal(dns.value, "example.com", "value is the domain");
+  assert.match(dns.detail, /DNS TXT challenge passed for example\.com on 2026-08-05\./);
+  // NEVER verified-org / host-popularity for http (D-07).
+  assert.equal(reputation.signals.find((s) => s.kind === "verified-org"), undefined);
+  assert.equal(reputation.signals.find((s) => s.kind === "host-popularity"), undefined);
+});
+
+test("http source: dns-stale → dns-stale signal, dated re-challenge detail (D-05, never a verdict)", async () => {
+  const dnsResult = { state: "dns-stale", token: undefined };
+  const priorDnsBlock = { dns_verified_at: "2026-06-28T00:00:00.000Z" };
+  const { reputation } = await computeReputation(HTTP_MANIFEST, undefined, { dnsResult, priorDnsBlock });
+  const stale = reputation.signals.find((s) => s.kind === "dns-stale");
+  assert.ok(stale, "dns-stale signal present");
+  assert.match(stale.detail, /DNS verification stale \(last passed 2026-06-28\); re-challenge pending\./);
+  // NEVER verified-org / host-popularity for http.
+  assert.equal(reputation.signals.find((s) => s.kind === "verified-org"), undefined);
+  assert.equal(reputation.signals.find((s) => s.kind === "host-popularity"), undefined);
+});
+
+test("http source: dns-pending → reputation-pending signal, NO verified-org (D-07)", async () => {
+  const dnsResult = { state: "dns-pending", token: undefined };
+  const { reputation } = await computeReputation(HTTP_MANIFEST, undefined, { dnsResult });
+  const pending = reputation.signals.find((s) => s.kind === "reputation-pending");
+  assert.ok(pending, "dns-pending degrades to reputation-pending signal");
+  assert.match(pending.detail, /DNS verification pending\./);
+  assert.equal(reputation.signals.find((s) => s.kind === "verified-org"), undefined);
+  assert.equal(reputation.signals.find((s) => s.kind === "host-popularity"), undefined);
+});
+
+test("http source: no dnsResult threaded → reputation-pending (defensive default)", async () => {
+  const { reputation } = await computeReputation(HTTP_MANIFEST, undefined, {});
+  const pending = reputation.signals.find((s) => s.kind === "reputation-pending");
+  assert.ok(pending, "absent dnsResult → reputation-pending");
+  assert.equal(reputation.signals.find((s) => s.kind === "dns-verified-domain"), undefined);
+});
+
+test("http source: the http branch NEVER makes a GitHub REST call (no /repos, /users, /orgs)", async () => {
+  const calls = [];
+  const gh = async (path) => {
+    calls.push(path);
+    throw new Error(`mock gh should NOT be called for http source: ${path}`);
+  };
+  const dnsResult = { state: "dns-verified-domain", dns_verified_at: "2026-08-05T00:00:00.000Z" };
+  const { reputation } = await computeReputation(HTTP_MANIFEST, undefined, { gh, dnsResult });
+  assert.ok(reputation, "reputation computed via the http branch (no gh call needed)");
+  assert.equal(calls.length, 0, "the http branch must never invoke the GitHub fetcher");
+});
