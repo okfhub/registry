@@ -41,8 +41,17 @@ import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
 // PHASE 7 (D-02): publisher reputation compute — attached to the bundle as a
 // SIBLING to `evidence` (NOT folded into evidence.checks[]). Computed fresh on
-// every build (D-06); never uses the smartRecompute cron-carry-forward path.
+// every build (D-06); never uses the smartReupdate cron-carry-forward path.
 import { computeReputation } from "./checks/reputation.mjs";
+// PHASE 8 (HTTP-02/HTTP-03): the build-side HTTP fetcher twin + the DNS TXT
+// challenge resolver. fetchHttpSource is imported from the BUILD-SIDE relative
+// path (./checks/fetch-http-source.mjs — the vendored twin from Plan 02), NOT
+// from okfhub-cli/src/lib/source.ts (an unresolvable cross-repo TS import).
+// Returns the SAME { extractDir, bundleDir, resolvedRef } contract as
+// cloneAndExtract, with resolvedRef = content SHA (D-06). dnsVerify is the
+// never-throw DNS verification entry point (dns-verified-domain/dns-stale/dns-pending).
+import { fetchHttpSource } from "./checks/fetch-http-source.mjs";
+import { dnsVerify } from "./checks/dns-verify.mjs";
 
 // VENDORED from okfhub-cli/src/lib/manifest.ts — keep in sync (CLI is source of truth).
 // Phase 1 of the manifest schema (ManifestSchema + SourceSchema). Byte-identical
@@ -137,10 +146,22 @@ export async function materializeConcepts(bundleDir) {
  *   — it stays evidence-pending AND concept-pending).
  */
 export async function computeEvidence(manifest, manifestPath, opts = {}) {
+  // PHASE 8 (HTTP-02/HTTP-03): dispatch on source.type. The github branch is
+  // UNCHANGED (clone → verifyBundle → materializeConcepts → computeReputation).
+  // The http branch runs fetchHttpSource (the build-side twin, injected via
+  // opts.fetchHttp for tests) → verifyBundle (UNCHANGED — pure, source-agnostic)
+  // → dnsVerify (the DNS TXT challenge, opts.resolver threads through) →
+  // computeReputation (the http branch inside reputation.mjs emits the dated
+  // dns-verified-domain/dns-stale signal from the threaded dnsResult). A DNS
+  // verify failure degrades the bundle to dns-pending WITHOUT aborting the
+  // build (the per-bundle try/catch stays — one bad bundle never blocks the index).
+  if (manifest.source?.type === "http") {
+    return computeHttpEvidence(manifest, manifestPath, opts);
+  }
   if (!manifest.source || manifest.source.type !== "github") {
     return {
       bundle: { ...manifest },
-      warning: `${manifestPath}: source type '${manifest.source?.type}' not supported (only 'github') — evidence skipped.`,
+      warning: `${manifestPath}: source type '${manifest.source?.type}' not supported (only 'github', 'http') — evidence skipped.`,
     };
   }
   // Production uses the real hardened clone; tests inject a local-dir resolver
@@ -199,6 +220,115 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
         source: { resolved_sha: resolvedRef },
         conceptArtifacts,
         reputation: repResult.reputation,
+      },
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      bundle: { ...manifest },
+      warning: `${manifestPath}: evidence compute failed (${msg}) — bundle stays evidence-pending.`,
+    };
+  }
+}
+
+/**
+ * The http branch of computeEvidence (Phase 8, HTTP-02/HTTP-03). Mirrors the
+ * github branch's structure but swaps cloneAndExtract → fetchHttpSource and
+ * threads dnsVerify between verifyBundle and computeReputation:
+ *   fetchHttpSource → verifyBundle (UNCHANGED) → dnsVerify → computeReputation(dns)
+ *
+ * verifyBundle is source-agnostic (reads bundleDir only) and runs IDENTICALLY for
+ * http and github — no weaker validation path for HTTP (T-08-VERIFY, HTTP-04).
+ * The DNS result is threaded into computeReputation via opts.dnsResult so its http
+ * branch can emit the dated dns-verified-domain/dns-stale signal, and the
+ * dns_verified_at is attached to the returned bundle (the dated-evidence anchor).
+ *
+ * A DNS verify failure degrades to dns-pending WITHOUT aborting — the dnsVerify
+ * call is wrapped in its own try/catch inside the outer per-bundle catch, so a
+ * bad DNS lookup flips the bundle's reputation to dns-pending but evidence + the
+ * rest of the index still ship (T-08-ISOLATION: one bad bundle never blocks the index).
+ *
+ * @param {object} manifest - validated http-sourced manifest
+ * @param {string} manifestPath - repo-relative path (warnings only)
+ * @param {object} opts - { fetchHttp, resolver, dnsResult?, ...rest threaded to
+ *   computeReputation }. opts.fetchHttp overrides fetchHttpSource for tests
+ *   (mirrors opts.clone). opts.resolver threads through to dnsVerify (the Wave-0
+ *   mock seam). opts.dnsResult is an OPTIONAL override (tests may inject the
+ *   final DNS state directly; production derives it from dnsVerify).
+ */
+async function computeHttpEvidence(manifest, manifestPath, opts = {}) {
+  // Production uses the build-side fetcher twin; tests inject a local-dir stub
+  // via opts.fetchHttp (mirrors the opts.clone seam at L145). Both return the
+  // SAME { extractDir, bundleDir, resolvedRef } contract.
+  const fetchHttp = opts.fetchHttp ?? fetchHttpSource;
+  try {
+    const { extractDir, bundleDir, resolvedRef } = await fetchHttp(manifest, opts);
+    let checks;
+    let conceptArtifacts;
+    try {
+      // verifyBundle runs UNCHANGED (pure, source-agnostic — reads bundleDir
+      // only). HTTP bundles are validated IDENTICALLY to GitHub bundles (HTTP-04).
+      checks = (await verifyBundle(bundleDir)).checks;
+      conceptArtifacts = await materializeConcepts(bundleDir);
+    } finally {
+      const { rm } = await import("node:fs/promises");
+      await rm(extractDir, { recursive: true, force: true });
+    }
+    // The 6th check (source-reachable) — pass since the tarball GET succeeded.
+    checks.push({ id: "source-reachable", name: "Source repo reachable", severity: "quality", status: "pass" });
+
+    // PHASE 8 (HTTP-02): run the DNS TXT challenge (never-throw). opts.resolver
+    // threads through for tests (the Wave-0 mock seam). A DNS failure degrades
+    // to dns-pending (state) but does NOT abort — the outer catch only fires on
+    // fetch/verify failures. priorBlock (the prior build's dns_verified_at) is
+    // undefined here per A-CF (same as github reputation); the carry-forward /
+    // stale detection is implemented + unit-tested in dns-verify.mjs.
+    let dnsResult = opts.dnsResult;
+    let dnsWarning;
+    if (!dnsResult) {
+      try {
+        dnsResult = await dnsVerify(manifest, undefined, opts);
+      } catch (e) {
+        // Never let a DNS failure abort the build — degrade to dns-pending.
+        dnsResult = { state: "dns-pending", token: undefined };
+        dnsWarning = e instanceof Error ? e.message : String(e);
+      }
+      if (dnsResult.warning) dnsWarning = dnsResult.warning;
+    }
+
+    // Thread the dnsResult into computeReputation so the http branch emits the
+    // dated dns-verified-domain/dns-stale signal. Also thread the prior DNS
+    // block (derived from dnsResult.dns_verified_at) for the stale-state date.
+    const priorDnsBlock =
+      typeof dnsResult.dns_verified_at === "string"
+        ? { dns_verified_at: dnsResult.dns_verified_at }
+        : undefined;
+    const repResult = await computeReputation(manifest, undefined, {
+      ...opts,
+      dnsResult,
+      priorDnsBlock,
+    });
+    if (repResult.warning) console.warn(`⚠️ reputation: ${repResult.warning}`);
+    if (dnsWarning) console.warn(`⚠️ dns: ${dnsWarning}`);
+
+    return {
+      bundle: {
+        ...manifest,
+        evidence: {
+          evidence_version: 1,
+          namespace: manifest.namespace,
+          name: manifest.name,
+          resolved_sha: resolvedRef,
+          checked_at: new Date().toISOString(),
+          check_logic_version: CHECK_LOGIC_VERSION,
+          checks: sanitizeChecks(checks),
+        },
+        source: { resolved_sha: resolvedRef },
+        conceptArtifacts,
+        reputation: repResult.reputation,
+        // The dated-evidence anchor (HTTP-03). Present only when the DNS
+        // challenge passed or was carried forward within the 30d window.
+        ...(dnsResult.dns_verified_at && { dns_verified_at: dnsResult.dns_verified_at }),
       },
     };
   } catch (e) {
