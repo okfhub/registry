@@ -29,10 +29,21 @@ on:
       # silently dropping every external publish. Do NOT revert to the google-
       # only filter.
       - "io.github.*/*.json"
+      # Phase 8 (HTTP-02): io.http.<domain>/ publishes (HTTP-served bundles)
+      # trigger the build the same way io.github.* does. The http branch of
+      # computeEvidence runs fetchHttpSource + verifyBundle + dnsVerify, so an
+      # io.http.* manifest publish fires the full evidence + DNS-challenge compute.
+      - "io.http.*/*.json"
   schedule:
     # Weekly, Monday 03:00 UTC — D-06 decay recompute. source-reachable is the
     # only decay-able evidence check (the content checks are immutable at a
     # pinned SHA); the weekly run refreshes it without waiting for a publish.
+    #
+    # Phase 8 (HTTP-03, D-05): this cron is ALSO the DNS re-challenge cadence.
+    # computeEvidence's http branch re-runs dnsVerify every tick, so an
+    # io.http.* bundle whose dns_verified_at is older than 30d (DNS_STALE_WINDOW_MS)
+    # flips to the neutral dns-stale state on the weekly tick — defeating the
+    # domain-transfer-hijack window (Pitfall 1.4). No new workflow file (D-05).
     - cron: "0 3 * * 1"
   workflow_dispatch: {}
 
