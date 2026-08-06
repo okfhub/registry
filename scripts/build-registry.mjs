@@ -126,6 +126,13 @@ export async function materializeConcepts(bundleDir) {
   // PHASE 10 (D-03): also carry the parsed frontmatter object so buildGraph can
   // populate GraphNode title/tags/desc. Additive — the gateway only consumes
   // {relPath, body}; existing callers ignore the extra field.
+  //
+  // PHASE 10 (D-06): the SAME frontmatter object already carries the OKF v0.2
+  // families when present — generated {by, at}, verified [{by, at}],
+  // stale_after, status, sources — because parseBundle's ConceptFrontmatter
+  // schema is .passthrough() (structure.mjs:35-37). summarizeTrustBundle only
+  // READS them (never re-parses, never extends the schema — v0.2 is
+  // permissive: a concept missing any family is never rejected).
   return concepts.map((c) => ({
     relPath: c.relPath,
     type: c.type,
@@ -292,6 +299,208 @@ export function detectOpenwiki(artifacts) {
   return artifacts.some((a) => typeof a?.body === "string" && a.body.includes("<!-- OPENWIKI:START -->"));
 }
 
+// ---------------------------------------------------------------------------
+// PHASE 10 (D-06) — OKF v0.2 content-trust read-path (Layer 1). The build
+// reads the additive v0.2 concept frontmatter families (generated/verified/
+// stale_after/status/sources) WHEN PRESENT — they are ALREADY preserved by
+// parseBundle's .passthrough() ConceptFrontmatter (structure.mjs:35-37), so
+// this is purely READ code: NO ConceptFrontmatter schema change, NO CLI
+// ManifestSchema change (the D-06 guardrail — v0.2 is a strict superset and
+// "consumers MUST NOT reject a concept for missing any optional family").
+//
+// summarizeTrustBundle is a deliberate MIRROR of the website's lib/trust.ts
+// summarizeTrust (the canonical pure consumer): registry-repo cannot import
+// the website's TS module, so the build emits the same TrustSummary shape
+// into registry.json (bundle.trust_summary) and the website re-derives at
+// render if it needs to. Keep the two in sync — the roll-up logic (tier
+// counts + dated-evidence rows, neutral glyphs only, never a 🟢/🔵/🟡 badge
+// per D-09) is identical by construction-test (tests/build-registry-trust).
+// ---------------------------------------------------------------------------
+
+/** Derive one concept's trust tier — mirror of lib/trust.ts deriveConceptTier
+ *  (OKF v0.2 spec §5.3). Never throws on malformed frontmatter. */
+function deriveConceptTierBuild(frontmatter) {
+  const fm = frontmatter && typeof frontmatter === "object" ? frontmatter : undefined;
+  const verified = fm?.verified;
+  if (!fm || !Array.isArray(verified) || verified.length === 0) return "unverified";
+  let sawEntry = false;
+  for (const v of verified) {
+    if (!v || typeof v !== "object") continue;
+    sawEntry = true;
+    if (typeof v.by === "string" && v.by.startsWith("human:")) return "human-reviewed";
+  }
+  return sawEntry ? "machine-confirmed" : "unverified";
+}
+
+/** Freshness from stale_after — mirror of lib/trust.ts deriveFreshness.
+ *  Absent/unparseable → "unknown", never throws. */
+function deriveFreshnessBuild(staleAfterIso, now = new Date()) {
+  if (!staleAfterIso || typeof staleAfterIso !== "string") return "unknown";
+  const d = Date.parse(staleAfterIso);
+  if (Number.isNaN(d)) return "unknown";
+  return d < now.getTime() ? "stale" : "fresh";
+}
+
+/** Coerce an author-controlled frontmatter value to display text. js-yaml
+ *  parses unquoted YAML dates (e.g. `at: 2026-08-06`) as Date objects —
+ *  normalize those to ISO so rows stay machine-readable. */
+function trustAsText(v) {
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (v instanceof Date) return v.toISOString();
+  return String(v);
+}
+
+/**
+ * PHASE 10 (D-06): roll the materialized concepts' v0.2 frontmatter up into
+ * the bundle-level trust_summary (the TrustSummary shape of
+ * okfhub-website/lib/types.ts — flat tier counts + tier_counts + dated-
+ * evidence rows with neutral glyphs only). Rides the existing
+ * materializeConcepts artifacts (no re-walk); reads each concept's parsed
+ * frontmatter (already populated by parseBundle's .passthrough()).
+ *
+ * PERMISSIVE: a concept missing any v0.2 family counts as "unverified" and
+ * contributes the honest absence row — NEVER rejected, NEVER undefined,
+ * NEVER an error (spec mandate; mirrors the website's never-throw contract).
+ * A malformed family (e.g. `verified: "garbage"`) degrades that ONE concept
+ * to unverified without aborting the roll-up.
+ *
+ * PURE over its inputs (no fs) — unit-testable with materialized artifacts.
+ *
+ * @param {Array<{frontmatter?: object}>} artifacts - materializeConcepts output
+ * @param {Date} [now] - derivation clock (tests pin it; production = build time)
+ * @returns {{trust_logic_version: 1, checked_at: string, total: number,
+ *   unverified: number, machineConfirmed: number, humanReviewed: number,
+ *   tier_counts: {unverified: number, machineConfirmed: number, humanReviewed: number},
+ *   generated?: {by?: string, at?: string},
+ *   freshness?: {stale_after?: string, status: string},
+ *   rows: Array<{glyph: string, text: string, dateIso?: string}>}}
+ */
+export function summarizeTrustBundle(artifacts, now = new Date()) {
+  const list = Array.isArray(artifacts) ? artifacts : [];
+  let unverified = 0;
+  let machineConfirmed = 0;
+  let humanReviewed = 0;
+  const rows = [];
+  const seen = new Set();
+  let generated;
+  let earliestStaleAfter;
+
+  const pushOnce = (row) => {
+    const key = `${row.glyph}|${row.text}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    rows.push(row);
+  };
+
+  for (const artifact of list) {
+    let tier = "unverified";
+    let gen;
+    let verified = [];
+    let staleAfter;
+    try {
+      const fm =
+        artifact?.frontmatter && typeof artifact.frontmatter === "object"
+          ? artifact.frontmatter
+          : undefined;
+      tier = deriveConceptTierBuild(fm);
+      gen = fm?.generated && typeof fm.generated === "object" ? fm.generated : undefined;
+      verified = Array.isArray(fm?.verified)
+        ? fm.verified.filter((v) => v != null && typeof v === "object")
+        : [];
+      const rawStale = fm?.stale_after;
+      staleAfter =
+        typeof rawStale === "string"
+          ? rawStale
+          : rawStale instanceof Date
+            ? rawStale.toISOString()
+            : undefined;
+    } catch {
+      // One pathological concept never blocks the roll-up — degrade it.
+      tier = "unverified";
+      gen = undefined;
+      verified = [];
+      staleAfter = undefined;
+    }
+
+    if (tier === "human-reviewed") humanReviewed += 1;
+    else if (tier === "machine-confirmed") machineConfirmed += 1;
+    else unverified += 1;
+
+    // ℹ generated by <agent> · <date>
+    if (gen && (gen.by != null || gen.at != null)) {
+      const by = trustAsText(gen.by);
+      const at = trustAsText(gen.at);
+      if (!generated) generated = { ...(by && { by }), ...(at && { at }) };
+      pushOnce({
+        glyph: "info",
+        text: at ? `generated by ${by} · ${at}` : `generated by ${by}`,
+        ...(at && { dateIso: at }),
+      });
+    }
+
+    // ℹ verified by <actor> · <date> — one row per distinct verifier.
+    for (const v of verified) {
+      const by = trustAsText(v.by);
+      const at = trustAsText(v.at);
+      pushOnce({
+        glyph: "info",
+        text: at ? `verified by ${by} · ${at}` : `verified by ${by}`,
+        ...(at && { dateIso: at }),
+      });
+    }
+
+    // Freshness: track the earliest parseable stale_after across concepts.
+    if (staleAfter !== undefined) {
+      const t = Date.parse(staleAfter);
+      if (!Number.isNaN(t)) {
+        if (!earliestStaleAfter || t < earliestStaleAfter.t) {
+          earliestStaleAfter = { iso: staleAfter, t };
+        }
+      }
+    }
+  }
+
+  // — N concepts with no verification frontmatter (honest absence, D-09).
+  if (list.length === 0) {
+    pushOnce({ glyph: "none", text: "no concepts indexed — no verification frontmatter" });
+  } else if (unverified > 0) {
+    pushOnce({
+      glyph: "none",
+      text:
+        unverified === 1
+          ? "1 concept with no verification frontmatter"
+          : `${unverified} concepts with no verification frontmatter`,
+    });
+  }
+
+  // ⏱ stale_after <date> · status: <stale|fresh|unknown>
+  let freshness;
+  if (earliestStaleAfter) {
+    const status = deriveFreshnessBuild(earliestStaleAfter.iso, now);
+    freshness = { stale_after: earliestStaleAfter.iso, status };
+    pushOnce({
+      glyph: "clock",
+      text: `stale_after ${earliestStaleAfter.iso} · status: ${status}`,
+      dateIso: earliestStaleAfter.iso,
+    });
+  }
+
+  const total = list.length;
+  return {
+    trust_logic_version: 1,
+    checked_at: now.toISOString(),
+    total,
+    unverified,
+    machineConfirmed,
+    humanReviewed,
+    tier_counts: { unverified, machineConfirmed, humanReviewed },
+    ...(generated && { generated }),
+    ...(freshness && { freshness }),
+    rows,
+  };
+}
+
 /**
  * Compute the D-10 evidence object for a manifest INLINE (Option A — no sidecar
  * read). Clones the public source, runs verifyBundle (5 checks), appends
@@ -394,6 +603,10 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
         source: { resolved_sha: resolvedRef },
         conceptArtifacts,
         reputation: repResult.reputation,
+        // PHASE 10 (D-06): the content-trust roll-up rides the SAME
+        // materialization (additive sibling to evidence/reputation — the
+        // CONTENT axis beside the PUBLISHER axis, never merged; D-09).
+        trust_summary: safeTrustSummary(conceptArtifacts, manifestPath),
       },
     };
   } catch (e) {
@@ -500,6 +713,9 @@ async function computeHttpEvidence(manifest, manifestPath, opts = {}) {
         source: { resolved_sha: resolvedRef },
         conceptArtifacts,
         reputation: repResult.reputation,
+        // PHASE 10 (D-06): content-trust roll-up — identical contract to the
+        // github branch (additive, permissive, never aborts).
+        trust_summary: safeTrustSummary(conceptArtifacts, manifestPath),
         // The dated-evidence anchor (HTTP-03). Present only when the DNS
         // challenge passed or was carried forward within the 30d window.
         ...(dnsResult.dns_verified_at && { dns_verified_at: dnsResult.dns_verified_at }),
@@ -511,6 +727,26 @@ async function computeHttpEvidence(manifest, manifestPath, opts = {}) {
       bundle: { ...manifest },
       warning: `${manifestPath}: evidence compute failed (${msg}) — bundle stays evidence-pending.`,
     };
+  }
+}
+
+/**
+ * PHASE 10 (D-06): the per-bundle trust-summary compute guard. Wraps
+ * summarizeTrustBundle so one pathological artifact set degrades to the
+ * honest all-unverified summary (correct total — one empty frontmatter per
+ * concept) instead of aborting the bundle build. Mirrors the "one bad bundle
+ * never blocks the index" discipline (T-10-04 build-side).
+ */
+function safeTrustSummary(conceptArtifacts, label) {
+  try {
+    return summarizeTrustBundle(conceptArtifacts);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.warn(`⚠️ trust: ${label}: trust summary failed (${msg}) — degrading to all-unverified.`);
+    const fallback = Array.isArray(conceptArtifacts)
+      ? conceptArtifacts.map(() => ({ frontmatter: undefined }))
+      : [];
+    return summarizeTrustBundle(fallback);
   }
 }
 
@@ -662,6 +898,14 @@ async function main() {
     // carry openwiki_detected:false (explicit, so the website can distinguish
     // "scanned, not detected" from "never scanned" = field absent).
     b.openwiki_detected = detectOpenwiki(artifacts);
+    // PHASE 10 (D-06): refresh the content-trust roll-up from the SAME
+    // materialized artifacts. computeEvidence already computed it; this is a
+    // deterministic recompute (belt-and-braces so the shipped trust_summary
+    // is always pinned to the artifacts actually written to concepts/). A
+    // bundle with NO v0.2 frontmatter gets the honest all-unverified summary
+    // here — never undefined, never an error (spec mandate: consumers MUST
+    // NOT reject a concept for missing any optional family).
+    b.trust_summary = safeTrustSummary(artifacts, `${b.namespace}/${b.name}`);
     console.log(`✅ materialized ${artifacts.length} concepts for ${b.namespace}/${b.name}${b.openwiki_detected ? " (openwiki detected)" : ""}`);
   }
   // PHASE 10 (D-03): emit the sibling graphs.json — one ConceptGraph per
