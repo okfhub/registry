@@ -36,7 +36,15 @@ import { z } from "zod";
 // PHASE 5: parseBundle is ALSO imported — computeEvidence now materializes
 // concept bodies (D-04) from the SAME walk verifyBundle uses, so evidence and
 // the live read pin to the same resolved_sha (Phase-4 D-06 consistency).
-import { verifyBundle, parseBundle } from "./checks/structure.mjs";
+// PHASE 10 (D-03): extractGraphEdges reuses structure.mjs's link-resolution
+// logic (extractLinkTargets + the T-10-01 escape guard) to emit resolved +
+// broken concept-graph edges. findDanglingLinks stays untouched (it still
+// feeds the links-resolve warn check).
+import { verifyBundle, parseBundle, extractGraphEdges } from "./checks/structure.mjs";
+// PHASE 10 (D-03): re-export so the graph build + its tests import from one
+// module. extractGraphEdges itself is defined in checks/structure.mjs (it
+// reuses findDanglingLinks's resolution logic verbatim).
+export { extractGraphEdges };
 import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
 // PHASE 7 (D-02): publisher reputation compute — attached to the bundle as a
@@ -115,7 +123,173 @@ const CHECK_LOGIC_VERSION = 1;
  */
 export async function materializeConcepts(bundleDir) {
   const { concepts } = await parseBundle(bundleDir);
-  return concepts.map((c) => ({ relPath: c.relPath, type: c.type, body: c.body }));
+  // PHASE 10 (D-03): also carry the parsed frontmatter object so buildGraph can
+  // populate GraphNode title/tags/desc. Additive — the gateway only consumes
+  // {relPath, body}; existing callers ignore the extra field.
+  return concepts.map((c) => ({
+    relPath: c.relPath,
+    type: c.type,
+    body: c.body,
+    frontmatter: c.frontmatter,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 10 (D-03 + D-08) — the concept-graph build + OpenWiki trace detection.
+// Both ride the EXISTING materializeConcepts walk (Option A: compute inline at
+// build, never re-walk the tree). The graph flows:
+//   extractGraphEdges (structure.mjs) → buildGraph → emitGraphs → graphs.json
+//   → cross-repo push → okfhub-website/lib/graph.ts loadGraph → ConceptGraph.
+// ---------------------------------------------------------------------------
+
+// The SVG viewport ConceptGraph.tsx renders into (viewBox "0 0 920 480").
+// Layout coordinates are computed at build time (deterministic — no runtime
+// force simulation in the component) so the same input always renders the
+// same picture.
+const GRAPH_VIEW = { w: 920, h: 480 };
+
+/** Deterministic radial "force" layout: index-ish node centered, the rest on
+ *  concentric rings. Unique positions by construction (no two nodes overlap). */
+function forcePositions(count) {
+  const cx = GRAPH_VIEW.w / 2;
+  const cy = GRAPH_VIEW.h / 2;
+  const positions = [];
+  if (count === 0) return positions;
+  positions.push([cx, cy]);
+  let placed = 1;
+  let ring = 1;
+  while (placed < count) {
+    const radius = Math.min(70 * ring, Math.min(cx, cy) - 40);
+    const onRing = Math.min(count - placed, Math.max(6, Math.floor((2 * Math.PI * radius) / 56)));
+    for (let i = 0; i < onRing; i++) {
+      const angle = (2 * Math.PI * i) / onRing + ring * 0.35; // ring phase offset
+      positions.push([
+        Math.round((cx + radius * Math.cos(angle)) * 10) / 10,
+        Math.round((cy + radius * Math.sin(angle)) * 10) / 10,
+      ]);
+    }
+    placed += onRing;
+    ring += 1;
+  }
+  return positions;
+}
+
+/** Deterministic "by path" hierarchy layout: depth = row, siblings spread
+ *  across the row. Unique positions by construction. */
+function hierPositions(relPaths) {
+  const byDepth = new Map(); // depth → [sortIndex,...]
+  relPaths.forEach((relPath, i) => {
+    const depth = relPath.split("/").length - 1;
+    if (!byDepth.has(depth)) byDepth.set(depth, []);
+    byDepth.get(depth).push(i);
+  });
+  const positions = new Array(relPaths.length);
+  const depths = [...byDepth.keys()].sort((a, b) => a - b);
+  depths.forEach((depth) => {
+    const row = byDepth.get(depth);
+    const y = Math.min(70 + depth * 90, GRAPH_VIEW.h - 40);
+    row.forEach((idx, col) => {
+      const x = Math.round(((GRAPH_VIEW.w - 120) * (col + 1)) / (row.length + 1)) + 60;
+      positions[idx] = [x, y];
+    });
+  });
+  return positions;
+}
+
+/** Frontmatter → GraphNode scalar coercion. The website renders every field as
+ *  escaped React text, so user-controlled frontmatter is data only here — but
+ *  coerce to strings/empty so a malformed frontmatter can never emit a
+ *  non-serializable graph (never-throw discipline). */
+function fmString(v) {
+  if (typeof v === "string") return v;
+  if (Array.isArray(v)) return v.filter((x) => typeof x === "string").join(", ");
+  return v == null ? "" : String(v);
+}
+
+/**
+ * Build one bundle's ConceptGraph (the {NODES, EDGES} shape of
+ * okfhub-website/lib/types.ts GraphNode/GraphEdge/ConceptGraph).
+ *
+ * NODES: one per materialized concept — id = relPath minus the .md suffix,
+ * type/path/title/tags/desc from frontmatter, deterministic force/hier layout
+ * coordinates. EDGES: the extractGraphEdges output mapped to [from, to, true?]
+ * tuples (3rd element true = broken — ConceptGraph.tsx renders dashed-red).
+ *
+ * PURE over its inputs (no fs) — unit-testable with synthetic concepts/edges.
+ *
+ * @param {Array<{relPath: string, type: string, frontmatter?: object}>} concepts
+ * @param {Array<{from: string, to: string, broken?: boolean}>} edges
+ * @returns {{NODES: object[], EDGES: Array<[string, string, true?]>}}
+ */
+export function buildGraph(concepts, edges) {
+  const relPaths = concepts.map((c) => c.relPath);
+  const force = forcePositions(concepts.length);
+  const hier = hierPositions(relPaths);
+  const NODES = concepts.map((c, i) => {
+    const fm = c.frontmatter ?? {};
+    return {
+      id: c.relPath.replace(/\.md$/, ""),
+      type: fmString(c.type),
+      path: c.relPath,
+      title: fmString(fm.title),
+      tags: fmString(fm.tags),
+      desc: fmString(fm.description),
+      force: force[i],
+      hier: hier[i],
+    };
+  });
+  const EDGES = edges.map((e) => (e.broken ? [e.from, e.to, true] : [e.from, e.to]));
+
+  // Broken-edge targets get an `unresolved: true` placeholder NODE so
+  // ConceptGraph.tsx can render them: the edge draw skips any endpoint not in
+  // nodeById (L72-73), and the dashed-red broken rendering + legend (L31, L82-84)
+  // + the Inspector's red "unresolved" badge all key off the placeholder node.
+  // Placeholder ids are deduped + appended AFTER the real nodes so the real
+  // nodes keep their deterministic layout slots. The target string is
+  // bundle-author-controlled DATA (rendered escaped by React — never resolved).
+  const known = new Set(NODES.map((n) => n.id));
+  const extras = [];
+  for (const e of edges) {
+    if (!e.broken) continue;
+    const id = String(e.to).replace(/\.md$/, "");
+    if (known.has(id)) continue;
+    known.add(id);
+    extras.push(id);
+  }
+  const extraForce = forcePositions(NODES.length + extras.length).slice(NODES.length);
+  const extraHier = hierPositions([...relPaths, ...extras.map((id) => `${id}.md`)]).slice(NODES.length);
+  extras.forEach((id, i) => {
+    NODES.push({
+      id,
+      type: "page",
+      path: id, // the target as written (inert label data — never resolved)
+      title: id,
+      tags: "",
+      desc: "",
+      force: extraForce[i],
+      hier: extraHier[i],
+      unresolved: true,
+    });
+  });
+
+  return { NODES, EDGES };
+}
+
+/**
+ * PHASE 10 (D-08): OpenWiki trace detection. OpenWiki (langchain-ai/openwiki)
+ * stamps a `<!-- OPENWIKI:START -->…<!-- OPENWIKI:END -->` marker comment
+ * around the block it rewrites on each run. Detection is repo-level: ANY
+ * materialized concept body carrying the START marker flips the additive
+ * `openwiki_detected` boolean on the bundle. Detection only — NO integration.
+ *
+ * PURE over its inputs (no fs, never throws on an empty set).
+ *
+ * @param {Array<{body?: string}>} artifacts - materializeConcepts output
+ * @returns {boolean}
+ */
+export function detectOpenwiki(artifacts) {
+  if (!Array.isArray(artifacts)) return false;
+  return artifacts.some((a) => typeof a?.body === "string" && a.body.includes("<!-- OPENWIKI:START -->"));
 }
 
 /**
@@ -483,8 +657,40 @@ async function main() {
       await writeFile(outPath, body, "utf8");
     }
     totalMaterialized += artifacts.length;
-    console.log(`✅ materialized ${artifacts.length} concepts for ${b.namespace}/${b.name}`);
+    // PHASE 10 (D-08): OpenWiki trace detection rides the SAME materialized
+    // artifacts (no re-walk). Additive boolean — bundles without the marker
+    // carry openwiki_detected:false (explicit, so the website can distinguish
+    // "scanned, not detected" from "never scanned" = field absent).
+    b.openwiki_detected = detectOpenwiki(artifacts);
+    console.log(`✅ materialized ${artifacts.length} concepts for ${b.namespace}/${b.name}${b.openwiki_detected ? " (openwiki detected)" : ""}`);
   }
+  // PHASE 10 (D-03): emit the sibling graphs.json — one ConceptGraph per
+  // bundle ({NODES, EDGES}), keyed `${namespace}/${name}`, computed from the
+  // SAME materialized artifacts (extractGraphEdges reads the concepts/ tree
+  // just written above). SIBLING file, NOT embedded in registry.json — graph
+  // data churn stays isolated from the per-page bundle index (T-10-03). Runs
+  // BEFORE the conceptArtifacts strip so the artifacts are still present;
+  // degrades per-bundle (a bundle whose artifacts are absent simply has no
+  // graph entry — the website's loadGraph falls back to the honest empty
+  // graph, never throws).
+  const GRAPHS_OUTPUT = "graphs.json";
+  const graphs = {};
+  let totalGraphs = 0;
+  for (const b of bundles) {
+    const artifacts = b.conceptArtifacts;
+    if (!artifacts || artifacts.length === 0) continue;
+    const edges = await extractGraphEdges(join(CONCEPTS_DIR, b.namespace, b.name), artifacts);
+    graphs[`${b.namespace}/${b.name}`] = buildGraph(artifacts, edges);
+    totalGraphs += 1;
+  }
+  const graphsOutput = {
+    generated_at: new Date().toISOString(),
+    graphs_logic_version: 1,
+    graphs,
+  };
+  await writeFile(GRAPHS_OUTPUT, JSON.stringify(graphsOutput, null, 2) + "\n", "utf8");
+  console.log(`✅ emitted ${totalGraphs} concept graphs → ${GRAPHS_OUTPUT}`);
+
   // Strip the transient conceptArtifacts payload — bodies live in concepts/, not
   // in the registry.json index (keeps registry.json lean; the gateway fs.readFile-s).
   //

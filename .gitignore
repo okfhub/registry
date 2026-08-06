@@ -8,3 +8,8 @@ registry.json
 # commits the tree cross-repo into okfhub-website/public/concepts/. Like
 # registry.json, it is regenerated fresh on every build — never hand-authored here.
 concepts/
+# graphs.json is a generated artifact (Phase 10, D-03): build-registry.mjs emits
+# the per-bundle concept graphs here alongside registry.json, and the GitHub
+# Action commits it cross-repo into okfhub-website/public/graphs.json. Like
+# registry.json, it is regenerated fresh on every build — never hand-authored here.
+graphs.json

@@ -130,25 +130,36 @@ test("graph: broken link emits [from, to, true] (ConceptGraph renders dashed-red
 });
 
 test("graph: path-escape is rejected (T-10-01 — no edge escaping the bundle dir)", async () => {
-  // A malicious ../../../etc/passwd link MUST NOT resolve to an edge pointing
-  // outside the bundle. The relative(bundleDir, resolved).startsWith("..")
-  // guard (findDanglingLinks's escape rejection, reused verbatim) flips it to
-  // a broken edge whose endpoint never escapes the bundle dir.
+  // A malicious ../../../etc/passwd link MUST NOT resolve to a REAL edge
+  // pointing outside the bundle. The relative(bundleDir, resolved).startsWith("..")
+  // guard (findDanglingLinks's escape rejection, reused verbatim) blocks the
+  // resolution; the attempt is surfaced as a BROKEN edge only.
   const { dir, concepts } = await parsedBundle({
     "a.md": concept("object", "Escape [x](../../../etc/passwd)."),
   });
   try {
     const edges = await extractGraphEdges(dir, concepts);
     const graph = buildGraph(concepts, edges);
-    for (const e of graph.EDGES) {
-      assert.ok(!String(e[1]).includes(".."), "no edge endpoint escapes the bundle dir");
-      assert.ok(!String(e[1]).startsWith("/"), "no absolute-path edge endpoint");
-    }
+
+    // THE GUARD: no RESOLVED edge exists — the escape never produced a real
+    // from→to edge. The only edge is broken (broken edges render dashed-red
+    // and carry no resolved target).
+    const resolvedEdges = graph.EDGES.filter((e) => e[2] !== true);
+    assert.equal(resolvedEdges.length, 0, "the escape MUST NOT emit a resolved edge");
+
     // The escape attempt is surfaced as BROKEN (dashed-red + legend), never
-    // silently dropped and never resolved.
+    // silently dropped and never resolved. The raw target rides along as inert
+    // label data (rendered escaped by React — never a navigable/resolved path).
     const escape = graph.EDGES.find((e) => e[0] === "a");
     assert.ok(escape, "the escape attempt still emits an edge (broken)");
     assert.equal(escape[2], true, "the escape attempt is marked broken");
+
+    // No node in the graph resolves to a path outside the bundle: every real
+    // (non-unresolved) node path stays inside the bundle dir.
+    for (const n of graph.NODES.filter((n) => !n.unresolved)) {
+      assert.ok(!n.path.startsWith("/"), "no absolute-path node");
+      assert.ok(!n.path.split("/").includes(".."), "no traversal in real node path");
+    }
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
