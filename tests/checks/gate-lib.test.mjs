@@ -18,11 +18,20 @@ const REPO = "okfhub/registry";
 function makeGh({ changedFiles = [], manifestJson = null, manifestPath, permission = null }) {
   return async function gh(path, init = {}) {
     // GET /repos/{repo}/collaborators/{user}/permission — infra-PR gate.
+    // Response shape matches the real GitHub API: top-level `permission` string
+    // + `role_name`; the granular `permissions` object is nested inside `user`.
     if (path.includes("/collaborators/") && path.endsWith("/permission")) {
       if (permission === null) return new Response("not found", { status: 404 });
       const push = ["admin", "maintain", "write", "triage"].includes(permission);
       return new Response(
-        JSON.stringify({ permission, permissions: { admin: permission === "admin", maintain: permission === "maintain", push, triage: permission === "triage", pull: true } }),
+        JSON.stringify({
+          permission,
+          user: {
+            login: "stub-author",
+            permissions: { admin: permission === "admin", maintain: permission === "maintain", push, triage: permission === "triage", pull: true },
+          },
+          role_name: permission,
+        }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }

@@ -117,23 +117,27 @@ async function fetchChangedFiles(gh, repo, prNumber) {
 /** Does the author have push permission on this repo? (infra-PR gate.)
  *
  *  Uses GET /repos/{repo}/collaborators/{username}/permission, which returns
- *  `{ permission, permissions: { admin, maintain, push, triage, pull } }`.
- *  `push` is true for admin/maintain/write/triage roles, false for read/none.
- *  Fail-closed: a non-2xx response (404 for a non-collaborator returns 404 on
- *  some configs, though the endpoint generally returns the resolved permission)
- *  is treated as "not a maintainer" so the infra PR stays red rather than
- *  silently auto-approving on an API hiccup. */
+ *  `{ permission, user: { ..., permissions: { admin, maintain, push, triage, pull } }, role_name }`.
+ *  The top-level `permission` is the canonical role string
+ *  ("admin"|"maintain"|"write"|"triage"|"read"|"none"). We treat
+ *  admin/maintain/write/triage as "maintainer" (can push), read/none as not.
+ *
+ *  BUGFIX: the previous implementation read `j.permissions.push` — but the
+ *  `permissions` object is nested inside `user`, not at the top level. So
+ *  `j.permissions` was always undefined, and isMaintainer returned false for
+ *  EVERY author (including admins). This silently broke the infra-PR gate path
+ *  from the day it was introduced (Phase 3, bbf48aa); it was never exercised
+ *  under the hardened main-protection ruleset (2026-08-04) because all prior
+ *  infra commits landed by direct push before the ruleset hardened.
+ *
+ *  Fail-closed: a non-2xx response is treated as "not a maintainer" so the
+ *  infra PR stays red rather than silently auto-approving on an API hiccup. */
 async function isMaintainer(gh, repo, authorLogin) {
   const res = await gh(`/repos/${repo}/collaborators/${encodeURIComponent(authorLogin)}/permission`);
-  // DEBUG (infra-PR gate gap): surface the raw status + body so we can see why
-  // the GITHUB_TOKEN resolves push:false. Remove once the gap is understood.
-  const body = await res.text().catch(() => "<unreadable>");
-  console.log(`isMaintainer: GET collaborators/${authorLogin}/permission → HTTP ${res.status}`);
-  console.log(`isMaintainer: body=${body.slice(0, 300)}`);
   if (!res.ok) return false;
-  let j;
-  try { j = JSON.parse(body); } catch { return false; }
-  return Boolean(j?.permissions?.push);
+  const j = await res.json().catch(() => ({}));
+  const role = j?.permission; // "admin"|"maintain"|"write"|"triage"|"read"|"none"
+  return role === "admin" || role === "maintain" || role === "write" || role === "triage";
 }
 
 /** Fetch the manifest JSON a PR publishes (from the head branch), if any. */
