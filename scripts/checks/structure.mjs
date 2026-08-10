@@ -221,6 +221,93 @@ async function findDanglingLinks(bundleDir, concepts) {
   return dangling;
 }
 
+/**
+ * PHASE 10 (D-03): graph-edge extraction — reuses the SAME resolution logic as
+ * findDanglingLinks (extractLinkTargets + isInternal + targetPath + the
+ * relative(bundleDir, resolved).startsWith("..") escape rejection) but instead
+ * of only counting dangling targets emits BOTH resolved and broken edges for
+ * the concept graph build (build-registry.mjs buildGraph → public/graphs.json).
+ *
+ * findDanglingLinks itself is UNCHANGED — it still feeds the links-resolve
+ * warn check. This sibling walks the same targets a second time (cheap: same
+ * files, same regexes) so the two concerns stay decoupled.
+ *
+ * SECURITY (T-10-01): a target escaping the bundle dir (../../etc/passwd) is
+ * rejected by the SAME guard verbatim and emitted as a BROKEN edge with the
+ * raw pathOnly as endpoint — never resolved outside the bundle. The endpoint
+ * is bundle-author-controlled content rendered on the website; ConceptGraph
+ * renders it escaped (React text), never as a navigable path.
+ *
+ * @param {string} bundleDir
+ * @param {Array<{relPath: string}>} concepts - parseBundle concepts (body may be absent; re-read from disk like findDanglingLinks)
+ * @returns {Promise<Array<{from: string, to: string, broken?: boolean}>>}
+ *   from/to are concept ids = relPath minus the .md suffix.
+ */
+export async function extractGraphEdges(bundleDir, concepts) {
+  const edges = [];
+  const idOf = (relPath) => relPath.replace(/\.md$/, "");
+  for (const concept of concepts) {
+    let body;
+    try {
+      body = await readFile(join(bundleDir, concept.relPath), "utf8");
+    } catch {
+      continue;
+    }
+    const stripped = stripCode(body);
+    const targets = extractLinkTargets(stripped);
+    const conceptDir = dirname(concept.relPath);
+    const from = idOf(concept.relPath);
+    for (const target of targets) {
+      if (!isInternal(target)) continue;
+      const pathOnly = targetPath(target);
+      if (pathOnly === "") continue;
+      const resolved = normalize(join(bundleDir, conceptDir, pathOnly));
+      if (relative(bundleDir, resolved).startsWith("..")) {
+        // Escape rejection (T-10-01 — same guard as findDanglingLinks): surface
+        // as a broken edge with the raw target, never resolve outside the bundle.
+        edges.push({ from, to: pathOnly, broken: true });
+        continue;
+      }
+      const found = await resolveTarget(resolved);
+      if (found) {
+        // Resolved target → a real edge. The endpoint is the resolved file's
+        // bundle-relative path minus .md so it matches GraphNode.id even when
+        // the link and the target live in different directories.
+        const rel = relative(bundleDir, found).split(sep).join("/");
+        edges.push({ from, to: idOf(rel) });
+      } else {
+        // Does not exist → broken edge (ConceptGraph.tsx renders e[2]===true
+        // as dashed-red with a legend — no component change needed).
+        edges.push({ from, to: pathOnly, broken: true });
+      }
+    }
+  }
+  return edges;
+}
+
+/**
+ * Resolve a link target to an existing file path (mirrors findDanglingLinks's
+ * exists() probe semantics): the exact path if it is a file, else the
+ * `<path>.md` probe (the extensionless [[wikilink]] form). Returns the
+ * resolved absolute path, or null when nothing resolves. Directories never
+ * resolve (a concept is a .md file).
+ */
+async function resolveTarget(resolved) {
+  try {
+    const s = await stat(resolved);
+    if (s.isFile()) return resolved;
+  } catch {
+    // fall through to the .md probe
+  }
+  try {
+    const s = await stat(`${resolved}.md`);
+    if (s.isFile()) return `${resolved}.md`;
+  } catch {
+    // not found
+  }
+  return null;
+}
+
 function stripCode(body) {
   return body
     .replace(/```[\s\S]*?```/g, "")
@@ -291,6 +378,11 @@ export async function checkStructure({ bundleDir }) {
   }
   return { passed: true, reason: "structure: bundle passes identity checks." };
 }
+
+// PHASE 10 (D-03): expose the link-resolution internals extractGraphEdges is
+// built on, so the graph build never re-implements link semantics (10-01-PLAN
+// prohibition: "MUST NOT reinvent link extraction").
+export { extractLinkTargets, findDanglingLinks };
 
 // Keep the __dirname reference live (anchors module resolution even if a future
 // edit drops the import); no runtime cost.

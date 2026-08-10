@@ -29,10 +29,21 @@ on:
       # silently dropping every external publish. Do NOT revert to the google-
       # only filter.
       - "io.github.*/*.json"
+      # Phase 8 (HTTP-02): io.http.<domain>/ publishes (HTTP-served bundles)
+      # trigger the build the same way io.github.* does. The http branch of
+      # computeEvidence runs fetchHttpSource + verifyBundle + dnsVerify, so an
+      # io.http.* manifest publish fires the full evidence + DNS-challenge compute.
+      - "io.http.*/*.json"
   schedule:
     # Weekly, Monday 03:00 UTC — D-06 decay recompute. source-reachable is the
     # only decay-able evidence check (the content checks are immutable at a
     # pinned SHA); the weekly run refreshes it without waiting for a publish.
+    #
+    # Phase 8 (HTTP-03, D-05): this cron is ALSO the DNS re-challenge cadence.
+    # computeEvidence's http branch re-runs dnsVerify every tick, so an
+    # io.http.* bundle whose dns_verified_at is older than 30d (DNS_STALE_WINDOW_MS)
+    # flips to the neutral dns-stale state on the weekly tick — defeating the
+    # domain-transfer-hijack window (Pitfall 1.4). No new workflow file (D-05).
     - cron: "0 3 * * 1"
   workflow_dispatch: {}
 
@@ -58,7 +69,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push registry.json + concept bodies to okfhub-website
+      - name: Push registry.json + graphs.json + concept bodies to okfhub-website
         env:
           SITE_TOKEN: ${{ secrets.OKFHUB_WEBSITE_TOKEN }}
         run: |
@@ -68,6 +79,14 @@ jobs:
           # SITE_TOKEN is passed via env, never echoed (no shell tracing).
           git clone --depth 1 "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" /tmp/site
           cp registry.json /tmp/site/public/registry.json
+          # Phase 10 (D-03): push the sibling graphs.json (one ConceptGraph per
+          # bundle, keyed namespace/name) alongside registry.json. The website
+          # lib/graph.ts loadGraph reads it at build time and degrades to the
+          # honest empty graph when absent (Pitfall-5), so a run that produced
+          # no graphs still ships fine — but guard the cp for symmetry.
+          if [ -f graphs.json ]; then
+            cp graphs.json /tmp/site/public/graphs.json
+          fi
           # Phase 5 (D-04/D-05): also push the materialized concept-body tree.
           # concepts/ is produced by build-registry.mjs alongside registry.json and
           # read by the gateway via fs.readFile (the same public/ channel). rsync
@@ -85,6 +104,11 @@ jobs:
           git config user.name "okfhub-registry-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add public/registry.json
+          # Phase 10 (D-03): stage the graphs.json sibling (guarded like concepts/
+          # — only present when this run produced at least the empty-map file).
+          if [ -f public/graphs.json ]; then
+            git add public/graphs.json
+          fi
           # CR-02: guard the concepts add. When concepts/ was NOT produced this run
           # AND the freshly-cloned site does not yet contain a public/concepts/ dir
           # (true on the very first run, and after any run that previously failed
@@ -101,5 +125,5 @@ jobs:
             echo "no change — registry.json + concepts already up to date"
             exit 0
           fi
-          git commit -m "chore: regenerate registry.json + concept bodies [skip ci]"
+          git commit -m "chore: regenerate registry.json + graphs.json + concept bodies [skip ci]"
           git push "https://x-access-token:${SITE_TOKEN}@github.com/asagajda/okfhub-website.git" main

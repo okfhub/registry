@@ -3,10 +3,13 @@
 // structural-identity check (#5, Phase 4 D-02 / VAL-02).
 //
 // Runs in the CHECK half only (merge-gate-check.yml, GITHUB_TOKEN). Reads the
-// pull_request event, finds the io.github.<org>/<name>.json manifest, fetches
-// it at the PR head, and downloads the manifest's source tarball. Prints the
-// extracted bundleDir absolute path to stdout (consumed by the workflow, which
-// exports it as STRUCTURE_BUNDLE_DIR for gate-check.mjs → evaluatePullRequest).
+// pull_request event, finds the io.github.<org>/<name>.json OR
+// io.http.<domain>/<name>.json manifest, fetches it at the PR head, and downloads
+// the manifest's source tarball. Dispatches on source.type: github →
+// cloneAndExtract (system curl + tar); http → fetchHttpSource (native fetch +
+// redirect:manual + content-SHA, the build-side twin). Prints the extracted
+// bundleDir absolute path to stdout (consumed by the workflow, which exports it
+// as STRUCTURE_BUNDLE_DIR for gate-check.mjs → evaluatePullRequest).
 //
 // WHY THIS IS A SEPARATE STEP (not inside evaluatePullRequest): the gate logic
 // is shared with the merge half, whose registry-scoped App token CANNOT clone
@@ -36,6 +39,7 @@ import { join, normalize, relative } from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { makeGh } from "./gate-lib.mjs";
+import { fetchHttpSource } from "./fetch-http-source.mjs";
 
 const execFileP = promisify(execFile);
 const REPO = process.env.GITHUB_REPOSITORY || "okfhub/registry";
@@ -74,19 +78,44 @@ async function fetchManifestPath(gh, prNumber) {
   const res = await gh(`/repos/${REPO}/pulls/${prNumber}/files?per_page=100`);
   if (!res.ok) throw new Error(`pulls/files HTTP ${res.status}`);
   const files = (await res.json()).map((f) => f.filename);
-  return files.find((f) => /^io\.github\.[a-z0-9-]+\//.test(f)) ?? null;
+  // Match both io.github.<org>/ and io.http.<domain>/ manifest paths (Phase 8
+  // adds the http family; the domain may contain dots+hyphens, e.g.
+  // io.http.example.com/bundle). Without this widening an io.http.* PR soft-skips
+  // at main() L175 and never reaches the L183 dispatch.
+  return files.find((f) => /^io\.(github|http)\.[a-z0-9.-]+\//.test(f)) ?? null;
 }
 
 /**
- * Path-traversal guard for tar entries (vendored from source.ts isSafePath).
- * Rejects absolute paths, `..` segments, and Windows drive letters.
+ * Path-traversal guard for tar entries. The WR-06-hardened single source of truth
+ * (byte-equivalent to okfhub-cli/src/lib/source.ts isSafePath:395-409). Rejects
+ * absolute paths, a LEADING Windows drive letter (e.g. C:/), and `..` segments.
+ *
+ * WR-06 reconciliation (Phase 8, HTTP-04 — T-08-TARGUARD): the OLD vendored copy
+ * used `n.includes(":")` (rejects ALL colons), which rejected legitimate concept
+ * filenames containing a colon (e.g. concepts/foo:bar.md). The traversal threat is
+ * the leading-drive form only, so we check `/^[a-z]:\//i` instead. This matches
+ * the CLI's canonical guard; fetch-http-source.mjs imports these to stay in sync.
  */
-function isSafePath(entryPath) {
+export function isSafePath(entryPath) {
   const n = normalize(entryPath).replace(/\\/g, "/");
-  if (n.startsWith("/")) return false;
-  if (n.includes(":")) return false;
-  if (n.includes("..")) return false;
+  if (n.startsWith("/")) return false; // absolute path
+  // WR-06: only reject a LEADING Windows drive letter (e.g. C:/), not any colon
+  // anywhere. The traversal threat is the leading-drive form.
+  if (/^[a-z]:\//i.test(n)) return false; // windows drive letter
+  if (n.includes("..")) return false; // traversal
   return !relative(".", n).startsWith("..");
+}
+
+/** Entry type names that represent links (symlinks + hardlinks). Mirrors
+ *  source.ts LINK_TYPES. */
+const LINK_TYPES = new Set(["SymbolicLink", "Link", "symlink", "hardlink"]);
+
+/** Minimal structural type covering tar listing entry shapes (.type, .linkpath). */
+export function isSafeEntry(entry) {
+  if (typeof entry.type === "string" && LINK_TYPES.has(entry.type)) return false;
+  if (typeof entry.isSymbolicLink === "function" && entry.isSymbolicLink()) return false;
+  if (entry.linkpath && !isSafePath(entry.linkpath)) return false;
+  return true;
 }
 
 /** Reject symlink/hardlink targets that escape the extract dir. */
@@ -172,7 +201,7 @@ async function main() {
   const { gh } = makeGh(TOKEN);
   const manifestPath = await fetchManifestPath(gh, pr.number);
   if (!manifestPath) {
-    console.log("clone-source: no io.github.* manifest in this PR — no source to clone (structure check skipped).");
+    console.log("clone-source: no io.github.* / io.http.* manifest in this PR — no source to clone (structure check skipped).");
     return;
   }
 
@@ -180,15 +209,28 @@ async function main() {
   if (!manifest) {
     throw new Error(`clone-source: could not read manifest ${manifestPath} at the PR head.`);
   }
-  if (!manifest.source || manifest.source.type !== "github") {
-    throw new Error(`structure: source type '${manifest.source?.type}' is not supported (only 'github').`);
+  // Source-type dispatch (Phase 8 — BLOCKER 2 fix, T-08-DISPATCH). The L183 throw
+  // that crashed the gate on every io.http.* PR is replaced by a dispatch: github
+  // → cloneAndExtract; http → fetchHttpSource. The throw narrows to fire ONLY for
+  // truly-unsupported types (git/tarball behind NotImplementedError, or unknown).
+  if (!manifest.source || (manifest.source.type !== "github" && manifest.source.type !== "http")) {
+    throw new Error(`structure: source type '${manifest.source?.type}' is not supported (only 'github' or 'http').`);
   }
 
-  const { owner, repo } = parseGithubUrl(manifest.source.url);
-  const ref = manifest.source.ref ?? "main";
-  const sourcePath = manifest.source.path ?? "";
-
-  const { extractDir, bundleDir } = await cloneAndExtract(owner, repo, ref, sourcePath);
+  let extractDir;
+  let bundleDir;
+  if (manifest.source.type === "http") {
+    // The build-side HTTP fetcher twin (fetch-http-source.mjs). Returns the SAME
+    // { extractDir, bundleDir, resolvedRef } contract as cloneAndExtract (resolvedRef
+    // = content SHA per D-06). main() only needs bundleDir/extractDir to emit the
+    // machine-readable JSON line for the workflow.
+    ({ extractDir, bundleDir } = await fetchHttpSource(manifest));
+  } else {
+    const { owner, repo } = parseGithubUrl(manifest.source.url);
+    const ref = manifest.source.ref ?? "main";
+    const sourcePath = manifest.source.path ?? "";
+    ({ extractDir, bundleDir } = await cloneAndExtract(owner, repo, ref, sourcePath));
+  }
 
   // Emit a machine-readable line: the bundleDir (consumed by the workflow) and
   // the extractDir (so the workflow can clean it up). Single-line JSON.

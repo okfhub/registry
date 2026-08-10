@@ -148,3 +148,144 @@ test("computeEvidence attaches reputation to the bundle (opts.clone + opts.gh in
     await rm(bundleDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Phase 8 (Plan 08-03 Task 1) — the computeEvidence http dispatch (HTTP-02).
+//
+// For source.type "http", computeEvidence dispatches to fetchHttpSource (injected
+// via opts.fetchHttp for tests) → verifyBundle (UNCHANGED) → dnsVerify (opts.resolver)
+// → computeReputation (with the dnsResult threaded in via opts.dnsResult). The
+// resulting bundle carries `reputation` + `dns_verified_at` alongside evidence.
+// A DNS verify failure degrades the bundle to dns-pending WITHOUT aborting the
+// build (the per-bundle try/catch stays). verifyBundle runs identically for
+// http and github (no semantic change).
+//
+// The opts.fetchHttp + opts.resolver + opts.dnsResult seams mirror the existing
+// opts.clone + opts.gh injection pattern.
+// ---------------------------------------------------------------------------
+
+test("http source: computeEvidence dispatches fetchHttpSource + verifyBundle + dnsVerify + computeReputation(dns)", async () => {
+  // 1) A local bundle dir with one valid concept so verifyBundle passes.
+  const bundleDir = await mkdtemp(join(tmpdir(), "okfhub-http-ev-"));
+  await mkdir(join(bundleDir, "concepts"), { recursive: true });
+  await writeFile(join(bundleDir, "concepts", "orders.md"), "---\ntype: Table\n---\n\n# Orders\n", "utf8");
+
+  const httpManifest = {
+    schema_version: 1,
+    name: "ga4-ecommerce",
+    namespace: "io.http.example.com",
+    description: "test",
+    version: "1.0.0",
+    source: { type: "http", url: "https://example.com/bundle.tar.gz", path: "", ref: "" },
+    kind: "knowledge",
+    categories: [],
+  };
+
+  // 2) opts.fetchHttp stub: returns the bundleDir as extractDir+bundleDir, with
+  //    a content-SHA resolvedRef (mirrors the clone stub's {extractDir,bundleDir,resolvedRef}).
+  const fetchHttp = async () => ({
+    extractDir: bundleDir,
+    bundleDir,
+    resolvedRef: "a".repeat(64), // content SHA (64 hex)
+  });
+
+  // 3) opts.resolver stub: a matching TXT record so dnsVerify returns
+  //    dns-verified-domain. The expected value is
+  //    okfhub-verify=io.http.example.com/ga4-ecommerce (D-01).
+  const expected = "okfhub-verify=io.http.example.com/ga4-ecommerce";
+  const resolver = makeMockResolverForBuild({
+    resolveTxt: () => [[expected]],
+  });
+
+  try {
+    const { bundle, warning } = await computeEvidence(
+      httpManifest,
+      "io.http.example.com/ga4-ecommerce.json",
+      { fetchHttp, resolver },
+    );
+    // verifyBundle ran (structural checks present) → evidence intact.
+    assert.ok(bundle.evidence, "verifyBundle ran for the http source → evidence present");
+    assert.equal(bundle.evidence.resolved_sha, "a".repeat(64), "resolvedRef = content SHA");
+    assert.equal(bundle.source.resolved_sha, "a".repeat(64));
+    // dnsVerify ran → dns_verified_at attached to the bundle.
+    assert.ok(bundle.dns_verified_at, "dns_verified_at attached to the http bundle");
+    assert.ok(typeof bundle.dns_verified_at === "string" && bundle.dns_verified_at.length > 0);
+    // computeReputation http branch fired → dns-verified-domain reputation.
+    assert.ok(bundle.reputation, "reputation populated for the http source");
+    const dns = bundle.reputation.signals.find((s) => s.kind === "dns-verified-domain");
+    assert.ok(dns, "dns-verified-domain reputation signal emitted");
+    assert.equal(dns.value, "example.com");
+    // NEVER verified-org for http (D-07).
+    assert.equal(bundle.reputation.signals.find((s) => s.kind === "verified-org"), undefined);
+  } finally {
+    await rm(bundleDir, { recursive: true, force: true });
+  }
+});
+
+test("http source: a DNS verify failure degrades to dns-pending WITHOUT aborting the build", async () => {
+  const bundleDir = await mkdtemp(join(tmpdir(), "okfhub-http-fail-"));
+  await mkdir(join(bundleDir, "concepts"), { recursive: true });
+  await writeFile(join(bundleDir, "concepts", "orders.md"), "---\ntype: Table\n---\n\n# Orders\n", "utf8");
+
+  const httpManifest = {
+    schema_version: 1,
+    name: "ga4-ecommerce",
+    namespace: "io.http.example.com",
+    description: "test",
+    version: "1.0.0",
+    source: { type: "http", url: "https://example.com/bundle.tar.gz", path: "", ref: "" },
+    kind: "knowledge",
+    categories: [],
+  };
+
+  const fetchHttp = async () => ({ extractDir: bundleDir, bundleDir, resolvedRef: "b".repeat(64) });
+
+  // opts.resolver that returns NO TXT record → verifyDnsChallenge false →
+  // no prior block → dns-pending. The build must NOT abort.
+  const resolver = makeMockResolverForBuild({
+    resolveTxt: () => [],
+  });
+
+  try {
+    const { bundle, warning } = await computeEvidence(
+      httpManifest,
+      "io.http.example.com/ga4-ecommerce.json",
+      { fetchHttp, resolver },
+    );
+    // Evidence still computed (DNS failure must not break it).
+    assert.ok(bundle.evidence, "evidence intact despite the DNS failure");
+    // Reputation degrades: dns-pending → reputation-pending (no verified-org).
+    assert.ok(bundle.reputation, "reputation block present (dns-pending case)");
+    const pending = bundle.reputation.signals.find((s) => s.kind === "reputation-pending");
+    assert.ok(pending, "DNS failure degrades to reputation-pending");
+    assert.equal(bundle.reputation.signals.find((s) => s.kind === "dns-verified-domain"), undefined);
+    // No warning aborts the build (the per-bundle isolation stays).
+    // A warning is acceptable (surfacing the DNS degradation to the log), but the
+    // bundle is still returned with evidence + reputation.
+    assert.equal(bundle.name, "ga4-ecommerce");
+  } finally {
+    await rm(bundleDir, { recursive: true, force: true });
+  }
+});
+
+/** Build a mock resolver for the build-registry attachment test (mirrors the
+ *  makeMockResolver factory in tests/checks/dns-verify.test.mjs). */
+function makeMockResolverForBuild({ resolveNs, resolve4, resolveTxt } = {}) {
+  const setServersCalls = [];
+  return {
+    setServersCalls,
+    async resolveNs() {
+      return resolveNs ?? ["ns1.example.com"];
+    },
+    async resolve4() {
+      return resolve4 ?? ["1.2.3.4"];
+    },
+    setServers(servers) {
+      setServersCalls.push(servers);
+    },
+    async resolveTxt() {
+      if (typeof resolveTxt === "function") return resolveTxt();
+      return resolveTxt ?? [];
+    },
+  };
+}

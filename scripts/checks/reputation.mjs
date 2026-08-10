@@ -68,6 +68,15 @@ function sanitizeSignals(signals) {
  *   always uses makeGh(process.env.GITHUB_TOKEN).
  */
 export async function computeReputation(manifest, priorReputation, opts = {}) {
+  // PHASE 8 (D-07): dispatch on source.type. The http branch emits dated-factual
+  // DNS signals (dns-verified-domain / dns-stale / reputation-pending) from the
+  // threaded dnsVerify result — it NEVER makes a GitHub REST call and NEVER emits
+  // verified-org / host-popularity (an HTTP bundle has no GitHub org; DNS never
+  // reaches the GitHub-verified tier). The github branch is unchanged below.
+  if (manifest?.source?.type === "http") {
+    return computeHttpReputation(manifest, opts);
+  }
+
   const { gh } = opts.gh ? { gh: opts.gh } : makeGh(process.env.GITHUB_TOKEN);
 
   // D-03 dispatch: only "github" is computed (today's only live source type).
@@ -184,6 +193,76 @@ function buildBlock(manifest, signals) {
     reputation_logic_version: REPUTATION_LOGIC_VERSION,
     signals: sanitizeSignals(signals),
   };
+}
+
+/**
+ * Compute the D-02 reputation block for an http-sourced manifest (Phase 8, D-07).
+ *
+ * An io.http.* bundle has NO GitHub org, so this branch NEVER emits verified-org
+ * or host-popularity (DNS never reaches the GitHub-verified tier — Pitfall 1.5).
+ * It reads the threaded dnsVerify result (opts.dnsResult) and emits exactly ONE
+ * dated-factual signal:
+ *   - dns-verified-domain → "DNS TXT challenge passed for <domain> on <date>."
+ *   - dns-stale           → "DNS verification stale (last passed <priorDate>); re-challenge pending."
+ *   - dns-pending         → reputation-pending "DNS verification pending."
+ *
+ * Every detail is dated factual copy, NEVER a verdict (D-07/D-08 — reinforced by
+ * the May-2026 npm Sigstore compromise). The detail strings carry the
+ * user-controlled domain (from io.http.<domain>) and are sanitizeSignals'd inside
+ * buildBlock (T-07-INJECT).
+ *
+ * @param {object} manifest - validated http-sourced manifest
+ * @param {{dnsResult?: object, priorDnsBlock?: {dns_verified_at?: string}}} opts
+ *   opts.dnsResult is the dnsVerify() return threaded from computeEvidence
+ *   ({ state, dns_verified_at?, token? }). opts.priorDnsBlock carries the prior
+ *   build's dns_verified_at for the stale-state date. Production threads both
+ *   from computeEvidence; tests inject them directly.
+ * @returns {{reputation: object}} always — the http branch always emits a block
+ *   (the degraded states are reputation-pending, not undefined).
+ */
+function computeHttpReputation(manifest, opts = {}) {
+  const domain = manifest.namespace.replace(/^io\.http\./, "");
+  const dnsResult = opts.dnsResult;
+  const priorDnsAt = opts.priorDnsBlock?.dns_verified_at;
+
+  let signals;
+  if (dnsResult?.state === "dns-verified-domain") {
+    const date = dnsResult.dns_verified_at ?? new Date().toISOString();
+    signals = [
+      {
+        kind: "dns-verified-domain",
+        value: domain,
+        detail: `DNS TXT challenge passed for ${domain} on ${formatDate(date)}.`,
+      },
+    ];
+  } else if (dnsResult?.state === "dns-stale") {
+    const last = priorDnsAt ? formatDate(priorDnsAt) : "previously";
+    signals = [
+      {
+        kind: "dns-stale",
+        detail: `DNS verification stale (last passed ${last}); re-challenge pending.`,
+      },
+    ];
+  } else {
+    // dns-pending (or no dnsResult threaded — defensive default). Reuse the
+    // existing pending kind (no new kind for a transient state).
+    signals = [
+      {
+        kind: "reputation-pending",
+        detail: "DNS verification pending.",
+      },
+    ];
+  }
+
+  return { reputation: buildBlock(manifest, signals) };
+}
+
+/** Format an ISO-8601 dns_verified_at as a YYYY-MM-DD date for dated-evidence
+ *  copy (HTTP-03 — dated factual, never a verdict). Robust to malformed input. */
+function formatDate(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toISOString().slice(0, 10);
 }
 
 /** D-07 transient fallback: carry-forward priorReputation (ORIGINAL checked_at)
