@@ -125,8 +125,14 @@ async function fetchChangedFiles(gh, repo, prNumber) {
  *  silently auto-approving on an API hiccup. */
 async function isMaintainer(gh, repo, authorLogin) {
   const res = await gh(`/repos/${repo}/collaborators/${encodeURIComponent(authorLogin)}/permission`);
+  // DEBUG (infra-PR gate gap): surface the raw status + body so we can see why
+  // the GITHUB_TOKEN resolves push:false. Remove once the gap is understood.
+  const body = await res.text().catch(() => "<unreadable>");
+  console.log(`isMaintainer: GET collaborators/${authorLogin}/permission → HTTP ${res.status}`);
+  console.log(`isMaintainer: body=${body.slice(0, 300)}`);
   if (!res.ok) return false;
-  const j = await res.json().catch(() => ({}));
+  let j;
+  try { j = JSON.parse(body); } catch { return false; }
   return Boolean(j?.permissions?.push);
 }
 
