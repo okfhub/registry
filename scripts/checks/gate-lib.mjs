@@ -515,15 +515,20 @@ export async function evaluatePullRequest(gh, repo, pr, opts = {}) {
   return { passed: true, reason: null, manifestPath, org, authorLogin, headSha, prNumber };
 }
 
-/** Merge the PR via the App installation token (D-08 / AUTH-04). */
-export async function mergePr(gh, repo, prNumber, headSha, commitTitle) {
+/** Merge the PR via the App installation token (D-08 / AUTH-04).
+ *  NOTE: `sha` is deliberately omitted — the App installation token is scoped to
+ *  the base repo only (okfhub/registry), not the fork (asagajda/registry). When
+ *  `sha` is present, GitHub validates the head commit against the fork repo, which
+ *  the App token cannot access → 403 "Resource not accessible by integration".
+ *  Without `sha`, the merge succeeds but trades off the head-pin guard (the
+ *  evaluate-and-merge is near-instant, so drift is negligible). */
+export async function mergePr(gh, repo, prNumber, _headSha, commitTitle) {
   const res = await gh(`/repos/${repo}/pulls/${prNumber}/merge`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       commit_title: commitTitle,
       merge_method: "squash",
-      sha: headSha, // pin the head — 409 on drift is handled by the caller
     }),
   });
   return res;
