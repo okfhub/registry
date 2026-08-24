@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "census-browser-automation",
+  "namespace": "io.github.asagajda",
+  "description": "Playwright Page Object for data.census.gov state profiles — automate browsing US Census demographic data: navigate state profiles, read stats, interact with charts and search.",
+  "version": "0.1.1",
+  "source": {
+    "type": "github",
+    "url": "https://github.com/asagajda/census-browser-automation",
+    "path": "",
+    "ref": "main"
+  },
+  "kind": "knowledge",
+  "categories": [
+    "browser-automation",
+    "census",
+    "demographics",
+    "playwright"
+  ],
+  "license": "MIT"
+}
