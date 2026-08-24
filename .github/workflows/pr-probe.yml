@@ -1,0 +1,7 @@
+name: PR trigger probe
+on: [pull_request]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "pull_request trigger works on $(date -u +%FT%TZ)"
