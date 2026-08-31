@@ -104,3 +104,82 @@ test("non-object input → REJECT", () => {
   assert.equal(checkSchema(42).passed, false);
   assert.equal(checkSchema(undefined).passed, false);
 });
+
+// paid-01 — the paid-layer block: optional (free bundles unchanged), and
+// LOUD on malformed paid data (a silently-dropped paid block would render a
+// gated bundle as free).
+test("schema: manifest WITHOUT paid still validates (additive, backward compat)", () => {
+  const r = checkSchema({
+    schema_version: 1,
+    name: "bundle",
+    namespace: "io.github.publisher",
+    description: "d",
+    version: "1.0.0",
+    source: { type: "github", url: "https://github.com/p/b", path: "", ref: "main" },
+  });
+  assert.equal(r.passed, true);
+});
+
+test("schema: well-formed paid block validates with defaults", () => {
+  const manifest = {
+    schema_version: 1,
+    name: "bundle",
+    namespace: "io.github.publisher",
+    description: "d",
+    version: "1.0.0",
+    source: { type: "github", url: "https://github.com/p/b", path: "", ref: "main" },
+    paid: {
+      provider: "polar",
+      organization_id: "org-1",
+      product_id: "prod-1",
+      benefit_id: "ben-1",
+      checkout_url: "https://buy.polar.sh/prod-1",
+      price_hint: { amount: 9.99, currency: "USD", recurring: "month" },
+      includes: ["Live schemas"],
+      pro_source: { type: "github", url: "https://github.com/p/private", path: "", ref: "main" },
+    },
+  };
+  const r = checkSchema(manifest);
+  assert.equal(r.passed, true);
+});
+
+test("schema: paid block rejects a non-polar provider and an empty pro_paths", () => {
+  const base = {
+    schema_version: 1,
+    name: "bundle",
+    namespace: "io.github.publisher",
+    description: "d",
+    version: "1.0.0",
+    source: { type: "github", url: "https://github.com/p/b", path: "", ref: "main" },
+  };
+  const badProvider = checkSchema({
+    ...base,
+    paid: {
+      provider: "stripe",
+      organization_id: "o",
+      product_id: "p",
+      benefit_id: "b",
+      checkout_url: "https://buy.polar.sh/x",
+      price_hint: { amount: 1, currency: "USD" },
+      includes: [],
+      pro_source: { type: "github", url: "https://github.com/p/x", path: "", ref: "main" },
+      pro_paths: ["pro/**"],
+    },
+  });
+  assert.equal(badProvider.passed, false);
+  const emptyPaths = checkSchema({
+    ...base,
+    paid: {
+      provider: "polar",
+      organization_id: "o",
+      product_id: "p",
+      benefit_id: "b",
+      checkout_url: "https://buy.polar.sh/x",
+      price_hint: { amount: 1, currency: "USD" },
+      includes: [],
+      pro_source: { type: "github", url: "https://github.com/p/x", path: "", ref: "main" },
+      pro_paths: [],
+    },
+  });
+  assert.equal(emptyPaths.passed, false);
+});

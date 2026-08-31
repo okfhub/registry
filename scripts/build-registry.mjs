@@ -47,6 +47,9 @@ import { verifyBundle, parseBundle, extractGraphEdges } from "./checks/structure
 export { extractGraphEdges };
 import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
+// paid-01: the pro_paths matcher (vendored CLI twin) — what keeps GATED
+// concepts out of the public concepts/ tree, graphs, and trust roll-up.
+import { matchesProPaths } from "./checks/paid-layer.mjs";
 // PHASE 7 (D-02): publisher reputation compute — attached to the bundle as a
 // SIBLING to `evidence` (NOT folded into evidence.checks[]). Computed fresh on
 // every build (D-06); never uses the smartReupdate cron-carry-forward path.
@@ -571,6 +574,19 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
     }
     // The 6th check (source-reachable) — pass since the tarball GET succeeded.
     checks.push({ id: "source-reachable", name: "Source repo reachable", severity: "quality", status: "pass" });
+    // paid-01: the honest paid-layer row. "skipped" (excluded from check
+    // counts) with the exact scope stated: gated concepts are DECLARED, kept
+    // out of the public index, and evaluated only via the gateway behind a
+    // license — never presented as publicly verified.
+    if (manifest.paid) {
+      checks.push({
+        id: "paid-layer",
+        name: "Paid layer",
+        severity: "quality",
+        status: "skipped",
+        detail: `declared (provider ${manifest.paid.provider}); gated concepts excluded from the public index; served only by the okfhub gateway with a valid license`,
+      });
+    }
     // PHASE 7 (D-02/D-06): compute publisher reputation as a sibling step. Runs
     // AFTER the structural clone+verify succeed, BEFORE the return. Reputation
     // is independent of the clone (REST /repos + /users + /orgs, not the
@@ -663,6 +679,19 @@ async function computeHttpEvidence(manifest, manifestPath, opts = {}) {
     }
     // The 6th check (source-reachable) — pass since the tarball GET succeeded.
     checks.push({ id: "source-reachable", name: "Source repo reachable", severity: "quality", status: "pass" });
+    // paid-01: the honest paid-layer row. "skipped" (excluded from check
+    // counts) with the exact scope stated: gated concepts are DECLARED, kept
+    // out of the public index, and evaluated only via the gateway behind a
+    // license — never presented as publicly verified.
+    if (manifest.paid) {
+      checks.push({
+        id: "paid-layer",
+        name: "Paid layer",
+        severity: "quality",
+        status: "skipped",
+        detail: `declared (provider ${manifest.paid.provider}); gated concepts excluded from the public index; served only by the okfhub gateway with a valid license`,
+      });
+    }
 
     // PHASE 8 (HTTP-02): run the DNS TXT challenge (never-throw). opts.resolver
     // threads through for tests (the Wave-0 mock seam). A DNS failure degrades
@@ -881,10 +910,28 @@ async function main() {
   // gateway reads bodies from concepts/, never from the index).
   const CONCEPTS_DIR = "concepts";
   let totalMaterialized = 0;
+  let totalGatedExcluded = 0;
   for (const b of bundles) {
     const artifacts = b.conceptArtifacts;
     if (!artifacts || artifacts.length === 0) continue;
-    for (const { relPath, body } of artifacts) {
+    // paid-01 — LEAK EXCLUSION (the load-bearing rule of the paid layer):
+    // concepts matching the bundle's paid.pro_paths are NEVER written to the
+    // public concepts/ tree, NEVER enter the graphs, and NEVER feed the public
+    // trust roll-up. The gated content exists only in the publisher's private
+    // pro_source repo; the gateway serves it live behind a license check. The
+    // exclusion count is logged (visible, auditable) — a bundle whose paid
+    // block gates EVERYTHING materializes an empty public tree (index-only),
+    // which is the correct outcome.
+    const paid = b.paid;
+    const publicArtifacts = paid
+      ? artifacts.filter((a) => !matchesProPaths(a.relPath, paid.pro_paths))
+      : artifacts;
+    const excluded = artifacts.length - publicArtifacts.length;
+    if (excluded > 0) {
+      totalGatedExcluded += excluded;
+      console.log(`🔒 excluded ${excluded} gated concept(s) from ${b.namespace}/${b.name} (paid layer: ${paid.pro_paths.join(", ")})`);
+    }
+    for (const { relPath, body } of publicArtifacts) {
       // relPath is POSIX-normalized relative to bundleDir (from parseBundle's
       // readdir walk — already validated, no traversal). Join against the
       // {namespace}/{name} base; mkdir -p semantics create any nested dirs.
@@ -892,12 +939,15 @@ async function main() {
       await mkdir(join(outPath, ".."), { recursive: true });
       await writeFile(outPath, body, "utf8");
     }
-    totalMaterialized += artifacts.length;
+    totalMaterialized += publicArtifacts.length;
+    if (publicArtifacts.length === 0) continue; // fully-gated bundle: index-only, nothing public to derive
     // PHASE 10 (D-08): OpenWiki trace detection rides the SAME materialized
     // artifacts (no re-walk). Additive boolean — bundles without the marker
     // carry openwiki_detected:false (explicit, so the website can distinguish
     // "scanned, not detected" from "never scanned" = field absent).
-    b.openwiki_detected = detectOpenwiki(artifacts);
+    // paid-01: computed over the PUBLIC artifacts only — gated content is not
+    // scanned, described, or hinted at in the public index.
+    b.openwiki_detected = detectOpenwiki(publicArtifacts);
     // PHASE 10 (D-06): refresh the content-trust roll-up from the SAME
     // materialized artifacts. computeEvidence already computed it; this is a
     // deterministic recompute (belt-and-braces so the shipped trust_summary
@@ -905,8 +955,10 @@ async function main() {
     // bundle with NO v0.2 frontmatter gets the honest all-unverified summary
     // here — never undefined, never an error (spec mandate: consumers MUST
     // NOT reject a concept for missing any optional family).
-    b.trust_summary = safeTrustSummary(artifacts, `${b.namespace}/${b.name}`);
-    console.log(`✅ materialized ${artifacts.length} concepts for ${b.namespace}/${b.name}${b.openwiki_detected ? " (openwiki detected)" : ""}`);
+    // paid-01: pinned to the PUBLIC artifacts — trust_summary counts free
+    // concepts only, which keeps its "total" honest against what's browsable.
+    b.trust_summary = safeTrustSummary(publicArtifacts, `${b.namespace}/${b.name}`);
+    console.log(`✅ materialized ${publicArtifacts.length} concepts for ${b.namespace}/${b.name}${b.openwiki_detected ? " (openwiki detected)" : ""}`);
   }
   // PHASE 10 (D-03): emit the sibling graphs.json — one ConceptGraph per
   // bundle ({NODES, EDGES}), keyed `${namespace}/${name}`, computed from the
@@ -923,8 +975,15 @@ async function main() {
   for (const b of bundles) {
     const artifacts = b.conceptArtifacts;
     if (!artifacts || artifacts.length === 0) continue;
-    const edges = await extractGraphEdges(join(CONCEPTS_DIR, b.namespace, b.name), artifacts);
-    graphs[`${b.namespace}/${b.name}`] = buildGraph(artifacts, edges);
+    // paid-01: graphs cover the PUBLIC set only — gated concepts never appear
+    // as nodes (their titles/paths would leak through the graph sidecar).
+    const paid = b.paid;
+    const publicArtifacts = paid
+      ? artifacts.filter((a) => !matchesProPaths(a.relPath, paid.pro_paths))
+      : artifacts;
+    if (publicArtifacts.length === 0) continue; // fully-gated: no public graph
+    const edges = await extractGraphEdges(join(CONCEPTS_DIR, b.namespace, b.name), publicArtifacts);
+    graphs[`${b.namespace}/${b.name}`] = buildGraph(publicArtifacts, edges);
     totalGraphs += 1;
   }
   const graphsOutput = {
@@ -934,6 +993,9 @@ async function main() {
   };
   await writeFile(GRAPHS_OUTPUT, JSON.stringify(graphsOutput, null, 2) + "\n", "utf8");
   console.log(`✅ emitted ${totalGraphs} concept graphs → ${GRAPHS_OUTPUT}`);
+  if (totalGatedExcluded > 0) {
+    console.log(`🔒 paid layer: ${totalGatedExcluded} gated concept(s) kept out of the public build in total`);
+  }
 
   // Strip the transient conceptArtifacts payload — bodies live in concepts/, not
   // in the registry.json index (keeps registry.json lean; the gateway fs.readFile-s).

@@ -3,5 +3,10 @@
     "new_namespace_per_day_per_identity": 3,
     "version_update_per_day_per_identity": 20,
     "registry_wide_prs_per_hour": 50
+  },
+  "paid_layer_limits": {
+    "comment": "paid-01 (POLAR-PAYWALL-PLAN §D). A manifest that ADDS or CHANGES a `paid` block counts against this lower ceiling: paid listings invoke gateway trust surfaces (private-repo access via the okfhub GitHub App, license-gated reads), so they ramp slower than free listings. Requires an established identity — a namespace must already have at least one merged (free) publish before its first paid PR passes.",
+    "paid_add_or_change_per_day_per_identity": 1,
+    "min_free_versions_before_first_paid": 1
   }
 }

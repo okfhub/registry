@@ -36,6 +36,7 @@ import { checkPathScope, namespaceOrgFromPath, namespaceFamilyFromPath } from ".
 import { checkOwnership, checkDnsOwnership } from "./ownership.mjs";
 import { checkRateLimit } from "./rate-limit.mjs";
 import { checkStructure } from "./structure.mjs";
+import { checkPaidLayer } from "./paid-layer.mjs";
 import { challengeRecordName, verifyDnsChallenge } from "./dns-verify.mjs";
 
 const API = process.env.GITHUB_API_URL || "https://api.github.com";
@@ -479,6 +480,27 @@ export async function evaluatePullRequest(gh, repo, pr, opts = {}) {
       passed: false,
       // D-10: HOLD, never close. The comment names the limit + count + reset.
       reason: `⏸️ **merge-gate held (rate-limit, not closed)**\n\n${rateResult.reason}`,
+      manifestPath,
+      org,
+      authorLogin,
+      headSha,
+      prNumber,
+    };
+  }
+
+  // 4.5) PAID LAYER (paid-01). Runs ONLY when the manifest declares a `paid`
+  //     block (free bundles short-circuit). Enforces: the free bundle already
+  //     exists on main, and checkout_url is a resolving polar.sh checkout.
+  //     `exists` was computed for the rate-limit step (same fact either way).
+  const paidResult = await checkPaidLayer({
+    manifest: manifestJson,
+    targetFileExistsOnMain: exists,
+    ...(opts.paidFetch && { paidFetch: opts.paidFetch }),
+  });
+  if (!paidResult.passed) {
+    return {
+      passed: false,
+      reason: `🚫 **merge-gate blocked**\n\n${paidResult.reason}`,
       manifestPath,
       org,
       authorLogin,
