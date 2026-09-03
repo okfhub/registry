@@ -23,6 +23,29 @@ export const SourceSchema = z.object({
   ref: z.string().default("main"),
 });
 
+// paid-01 — the paid-layer block. VENDORED mirror of okfhub-cli
+// src/lib/manifest.ts PaidSchema (the coordinated 4-copy rule: CLI manifest.ts,
+// THIS file, okfhub-website/lib/types.ts, and the registry index shape).
+// Publisher-set pricing only: okfhub never sets, caps, or intermediates prices;
+// price_hint is display-only (verified build-side against the live Polar page).
+// pro_source reuses SourceSchema; pro_paths must name at least one gated path
+// (min 1) — a paid block gating NOTHING would render a gated bundle as free.
+export const PaidSchema = z.object({
+  provider: z.literal("polar"),
+  organization_id: z.string().min(1),
+  product_id: z.string().min(1),
+  benefit_id: z.string().min(1),
+  checkout_url: z.string().url(),
+  price_hint: z.object({
+    amount: z.number().nonnegative(),
+    currency: z.string().regex(/^[a-zA-Z]{3}$/),
+    recurring: z.enum(["day", "week", "month", "year"]).nullish(),
+  }),
+  includes: z.array(z.string().min(1)).default([]),
+  pro_source: SourceSchema,
+  pro_paths: z.array(z.string().min(1)).min(1).default(["pro/**"]),
+});
+
 export const ManifestSchema = z.object({
   schema_version: z.literal(1),
   // WR-07: constrain name to lowercase-kebab (matches the namespace shape) so a
@@ -37,6 +60,8 @@ export const ManifestSchema = z.object({
   categories: z.array(z.string()).default([]),
   license: z.string().optional(),
   homepage: z.string().url().optional(),
+  // paid-01 — additive + optional; absent on free-only bundles.
+  paid: PaidSchema.optional(),
 });
 
 /**
