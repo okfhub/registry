@@ -47,14 +47,6 @@ import { verifyBundle, parseBundle, extractGraphEdges } from "./checks/structure
 export { extractGraphEdges };
 import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
-// paid-01 (whole-repo model): pro/ is RESERVED paid territory in EVERY bundle.
-// The publisher's private pro_source repo IS the paid layer and lands under
-// pro/ in a buyer's install (one repo ↔ one folder), so nothing from any
-// bundle's pro/ tree is ever materialized, graphed, or trust-rolled-up.
-function isReservedProPath(relPath) {
-  const norm = String(relPath).replace(/\\/g, "/");
-  return norm === "pro" || norm.startsWith("pro/");
-}
 // PHASE 7 (D-02): publisher reputation compute — attached to the bundle as a
 // SIBLING to `evidence` (NOT folded into evidence.checks[]). Computed fresh on
 // every build (D-06); never uses the smartReupdate cron-carry-forward path.
@@ -537,6 +529,40 @@ export function summarizeTrustBundle(artifacts, now = new Date()) {
  *   — it stays evidence-pending AND concept-pending).
  */
 export async function computeEvidence(manifest, manifestPath, opts = {}) {
+  // paid-02 (whole-bundle model): a PAID bundle's source is a PRIVATE repo.
+  // The registry never fetches, verifies, or materializes it — the listing is
+  // "declared, not evaluated": the gate checked the manifest + the Polar
+  // checkout, the okfhub gateway serves the content behind a license, and the
+  // only public evidence is the honest skipped row below (no resolved_sha —
+  // nothing about the content was verified, so none is implied). This branch
+  // runs BEFORE any source dispatch: no paid manifest, whatever its declared
+  // source type, is ever fetched publicly.
+  if (manifest.paid) {
+    const repResult = await computeReputation(manifest, undefined, opts);
+    if (repResult.warning) console.warn(`⚠️ reputation: ${repResult.warning}`);
+    return {
+      bundle: {
+        ...manifest,
+        evidence: {
+          evidence_version: 1,
+          namespace: manifest.namespace,
+          name: manifest.name,
+          checked_at: new Date().toISOString(),
+          check_logic_version: CHECK_LOGIC_VERSION,
+          checks: sanitizeChecks([
+            {
+              id: "paid-layer",
+              name: "Paid bundle (private source)",
+              severity: "quality",
+              status: "skipped",
+              detail: `declared (provider ${manifest.paid.provider}); the source repo is private and never fetched by the registry; content is served only by the okfhub gateway with a valid license`,
+            },
+          ]),
+        },
+        reputation: repResult.reputation,
+      },
+    };
+  }
   // PHASE 8 (HTTP-02/HTTP-03): dispatch on source.type. The github branch is
   // UNCHANGED (clone → verifyBundle → materializeConcepts → computeReputation).
   // The http branch runs fetchHttpSource (the build-side twin, injected via
@@ -555,6 +581,7 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
       warning: `${manifestPath}: source type '${manifest.source?.type}' not supported (only 'github', 'http') — evidence skipped.`,
     };
   }
+  // Production uses the real hardened clone; tests inject a local-dir resolver
   // Production uses the real hardened clone; tests inject a local-dir resolver
   // so the success path is unit-testable without a network call (mirrors how the
   // existing tests cover only the non-network paths of computeEvidence).
@@ -579,19 +606,6 @@ export async function computeEvidence(manifest, manifestPath, opts = {}) {
     }
     // The 6th check (source-reachable) — pass since the tarball GET succeeded.
     checks.push({ id: "source-reachable", name: "Source repo reachable", severity: "quality", status: "pass" });
-    // paid-01: the honest paid-layer row. "skipped" (excluded from check
-    // counts) with the exact scope stated: gated concepts are DECLARED, kept
-    // out of the public index, and evaluated only via the gateway behind a
-    // license — never presented as publicly verified.
-    if (manifest.paid) {
-      checks.push({
-        id: "paid-layer",
-        name: "Paid layer",
-        severity: "quality",
-        status: "skipped",
-        detail: `declared (provider ${manifest.paid.provider}); gated concepts excluded from the public index; served only by the okfhub gateway with a valid license`,
-      });
-    }
     // PHASE 7 (D-02/D-06): compute publisher reputation as a sibling step. Runs
     // AFTER the structural clone+verify succeed, BEFORE the return. Reputation
     // is independent of the clone (REST /repos + /users + /orgs, not the
@@ -915,27 +929,12 @@ async function main() {
   // gateway reads bodies from concepts/, never from the index).
   const CONCEPTS_DIR = "concepts";
   let totalMaterialized = 0;
-  let totalGatedExcluded = 0;
   for (const b of bundles) {
+    // paid-02: a paid bundle never reaches this loop — computeEvidence returns
+    // its index entry WITHOUT conceptArtifacts (private source, never fetched).
     const artifacts = b.conceptArtifacts;
     if (!artifacts || artifacts.length === 0) continue;
-    // paid-01 — LEAK EXCLUSION (the load-bearing rule of the paid layer):
-    // pro/ is reserved territory in EVERY bundle (paid or not). The gated
-    // content exists only in the publisher's private pro_source repo and is
-    // served live by the gateway behind a license check; nothing under pro/
-    // is ever written to the public concepts/ tree, the graphs, or the
-    // public trust roll-up. The exclusion count is logged (visible,
-    // auditable) — a bundle whose pro/ tree carries everything materializes
-    // an index-only public build, which is the correct outcome.
-    const publicArtifacts = artifacts.filter((a) => !isReservedProPath(a.relPath));
-    const excluded = artifacts.length - publicArtifacts.length;
-    if (excluded > 0) {
-      totalGatedExcluded += excluded;
-      const why = b.paid
-        ? "paid layer"
-        : "pro/ is reserved paid territory — declare a paid block to sell it";
-      console.log(`🔒 excluded ${excluded} pro/ concept(s) from ${b.namespace}/${b.name} (${why})`);
-    }
+    const publicArtifacts = artifacts;
     for (const { relPath, body } of publicArtifacts) {
       // relPath is POSIX-normalized relative to bundleDir (from parseBundle's
       // readdir walk — already validated, no traversal). Join against the
@@ -980,9 +979,8 @@ async function main() {
   for (const b of bundles) {
     const artifacts = b.conceptArtifacts;
     if (!artifacts || artifacts.length === 0) continue;
-    // paid-01: graphs cover the PUBLIC set only — nothing under pro/ ever
-    // appears as a node (its titles/paths would leak through the graph sidecar).
-    const publicArtifacts = artifacts.filter((a) => !isReservedProPath(a.relPath));
+    // paid-02: paid bundles never appear here (no conceptArtifacts at all).
+    const publicArtifacts = artifacts;
     if (publicArtifacts.length === 0) continue; // fully-gated: no public graph
     const edges = await extractGraphEdges(join(CONCEPTS_DIR, b.namespace, b.name), publicArtifacts);
     graphs[`${b.namespace}/${b.name}`] = buildGraph(publicArtifacts, edges);
@@ -995,9 +993,6 @@ async function main() {
   };
   await writeFile(GRAPHS_OUTPUT, JSON.stringify(graphsOutput, null, 2) + "\n", "utf8");
   console.log(`✅ emitted ${totalGraphs} concept graphs → ${GRAPHS_OUTPUT}`);
-  if (totalGatedExcluded > 0) {
-    console.log(`🔒 paid layer: ${totalGatedExcluded} gated concept(s) kept out of the public build in total`);
-  }
 
   // Strip the transient conceptArtifacts payload — bodies live in concepts/, not
   // in the registry.json index (keeps registry.json lean; the gateway fs.readFile-s).

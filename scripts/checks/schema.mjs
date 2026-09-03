@@ -26,11 +26,10 @@ export const SourceSchema = z.object({
 // paid-01 — the paid-layer block. VENDORED mirror of okfhub-cli
 // src/lib/manifest.ts PaidSchema (the coordinated 4-copy rule: CLI manifest.ts,
 // THIS file, okfhub-website/lib/types.ts, and the registry index shape).
-// Publisher-set pricing only: okfhub never sets, caps, or intermediates prices;
-// price_hint is display-only (verified build-side against the live Polar page).
-// pro_source reuses SourceSchema; the private repo's WHOLE tree is the paid
-// layer and lands under pro/ in a buyer's install (no path convention inside
-// the repo — pro/ is reserved territory in every bundle).
+// Whole-bundle model: a paid bundle's `source` IS the private content repo —
+// the paid block carries only the monetization metadata. Publisher-set pricing
+// only: okfhub never sets, caps, or intermediates prices; price_hint is
+// display-only (verified by review against the live Polar page).
 export const PaidSchema = z.object({
   provider: z.literal("polar"),
   organization_id: z.string().min(1),
@@ -43,7 +42,6 @@ export const PaidSchema = z.object({
     recurring: z.enum(["day", "week", "month", "year"]).nullish(),
   }),
   includes: z.array(z.string().min(1)).default([]),
-  pro_source: SourceSchema,
 });
 
 export const ManifestSchema = z.object({
