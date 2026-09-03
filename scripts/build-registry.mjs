@@ -47,9 +47,14 @@ import { verifyBundle, parseBundle, extractGraphEdges } from "./checks/structure
 export { extractGraphEdges };
 import { cloneAndExtract } from "./checks/clone-source.mjs";
 import { sanitizeForComment } from "./checks/gate-lib.mjs";
-// paid-01: the pro_paths matcher (vendored CLI twin) — what keeps GATED
-// concepts out of the public concepts/ tree, graphs, and trust roll-up.
-import { matchesProPaths } from "./checks/paid-layer.mjs";
+// paid-01 (whole-repo model): pro/ is RESERVED paid territory in EVERY bundle.
+// The publisher's private pro_source repo IS the paid layer and lands under
+// pro/ in a buyer's install (one repo ↔ one folder), so nothing from any
+// bundle's pro/ tree is ever materialized, graphed, or trust-rolled-up.
+function isReservedProPath(relPath) {
+  const norm = String(relPath).replace(/\\/g, "/");
+  return norm === "pro" || norm.startsWith("pro/");
+}
 // PHASE 7 (D-02): publisher reputation compute — attached to the bundle as a
 // SIBLING to `evidence` (NOT folded into evidence.checks[]). Computed fresh on
 // every build (D-06); never uses the smartReupdate cron-carry-forward path.
@@ -915,21 +920,21 @@ async function main() {
     const artifacts = b.conceptArtifacts;
     if (!artifacts || artifacts.length === 0) continue;
     // paid-01 — LEAK EXCLUSION (the load-bearing rule of the paid layer):
-    // concepts matching the bundle's paid.pro_paths are NEVER written to the
-    // public concepts/ tree, NEVER enter the graphs, and NEVER feed the public
-    // trust roll-up. The gated content exists only in the publisher's private
-    // pro_source repo; the gateway serves it live behind a license check. The
-    // exclusion count is logged (visible, auditable) — a bundle whose paid
-    // block gates EVERYTHING materializes an empty public tree (index-only),
-    // which is the correct outcome.
-    const paid = b.paid;
-    const publicArtifacts = paid
-      ? artifacts.filter((a) => !matchesProPaths(a.relPath, paid.pro_paths))
-      : artifacts;
+    // pro/ is reserved territory in EVERY bundle (paid or not). The gated
+    // content exists only in the publisher's private pro_source repo and is
+    // served live by the gateway behind a license check; nothing under pro/
+    // is ever written to the public concepts/ tree, the graphs, or the
+    // public trust roll-up. The exclusion count is logged (visible,
+    // auditable) — a bundle whose pro/ tree carries everything materializes
+    // an index-only public build, which is the correct outcome.
+    const publicArtifacts = artifacts.filter((a) => !isReservedProPath(a.relPath));
     const excluded = artifacts.length - publicArtifacts.length;
     if (excluded > 0) {
       totalGatedExcluded += excluded;
-      console.log(`🔒 excluded ${excluded} gated concept(s) from ${b.namespace}/${b.name} (paid layer: ${paid.pro_paths.join(", ")})`);
+      const why = b.paid
+        ? "paid layer"
+        : "pro/ is reserved paid territory — declare a paid block to sell it";
+      console.log(`🔒 excluded ${excluded} pro/ concept(s) from ${b.namespace}/${b.name} (${why})`);
     }
     for (const { relPath, body } of publicArtifacts) {
       // relPath is POSIX-normalized relative to bundleDir (from parseBundle's
@@ -975,12 +980,9 @@ async function main() {
   for (const b of bundles) {
     const artifacts = b.conceptArtifacts;
     if (!artifacts || artifacts.length === 0) continue;
-    // paid-01: graphs cover the PUBLIC set only — gated concepts never appear
-    // as nodes (their titles/paths would leak through the graph sidecar).
-    const paid = b.paid;
-    const publicArtifacts = paid
-      ? artifacts.filter((a) => !matchesProPaths(a.relPath, paid.pro_paths))
-      : artifacts;
+    // paid-01: graphs cover the PUBLIC set only — nothing under pro/ ever
+    // appears as a node (its titles/paths would leak through the graph sidecar).
+    const publicArtifacts = artifacts.filter((a) => !isReservedProPath(a.relPath));
     if (publicArtifacts.length === 0) continue; // fully-gated: no public graph
     const edges = await extractGraphEdges(join(CONCEPTS_DIR, b.namespace, b.name), publicArtifacts);
     graphs[`${b.namespace}/${b.name}`] = buildGraph(publicArtifacts, edges);

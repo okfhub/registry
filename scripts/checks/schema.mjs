@@ -28,8 +28,9 @@ export const SourceSchema = z.object({
 // THIS file, okfhub-website/lib/types.ts, and the registry index shape).
 // Publisher-set pricing only: okfhub never sets, caps, or intermediates prices;
 // price_hint is display-only (verified build-side against the live Polar page).
-// pro_source reuses SourceSchema; pro_paths must name at least one gated path
-// (min 1) — a paid block gating NOTHING would render a gated bundle as free.
+// pro_source reuses SourceSchema; the private repo's WHOLE tree is the paid
+// layer and lands under pro/ in a buyer's install (no path convention inside
+// the repo — pro/ is reserved territory in every bundle).
 export const PaidSchema = z.object({
   provider: z.literal("polar"),
   organization_id: z.string().min(1),
@@ -43,7 +44,6 @@ export const PaidSchema = z.object({
   }),
   includes: z.array(z.string().min(1)).default([]),
   pro_source: SourceSchema,
-  pro_paths: z.array(z.string().min(1)).min(1).default(["pro/**"]),
 });
 
 export const ManifestSchema = z.object({

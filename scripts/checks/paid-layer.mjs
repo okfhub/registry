@@ -28,34 +28,6 @@ const POLAR_CHECKOUT_HOSTS = new Set([
 ]);
 
 /**
- * paid-01 — does `relPath` (POSIX, relative to the bundle root) fall inside
- * the gated `paid.pro_paths` set? VENDORED from okfhub-cli/src/lib/installer.ts
- * (the CLI is the source of truth; the website's lib/mcp/pro.ts carries the
- * same vendored twin). Keep in sync across the three copies.
- * Patterns: "pro/**" (any depth), "dir/*" (one level), exact file path.
- *
- * @param {string} relPath
- * @param {string[]} patterns
- * @returns {boolean}
- */
-export function matchesProPaths(relPath, patterns) {
-  const norm = relPath.replace(/\\/g, "/");
-  return patterns.some((raw) => {
-    const pat = raw.replace(/\\/g, "/").replace(/^\.\//, "");
-    if (pat.endsWith("/**")) {
-      const prefix = pat.slice(0, -3);
-      return prefix === "" || norm.startsWith(prefix + "/");
-    }
-    if (pat.endsWith("/*")) {
-      const prefix = pat.slice(0, -2);
-      if (!norm.startsWith(prefix + "/")) return false;
-      return !norm.slice(prefix.length + 1).includes("/");
-    }
-    return norm === pat;
-  });
-}
-
-/**
  * @param {object} args
  * @param {object} args.manifest - the validated manifest JSON
  * @param {boolean} args.targetFileExistsOnMain - does <ns>/<name>.json exist on main?

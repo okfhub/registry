@@ -1,8 +1,8 @@
-// paid-layer.test.mjs — the paid-layer gate check + the vendored pro_paths
-// matcher (paid-01).
+// paid-layer.test.mjs — the paid-layer gate check (paid-01, whole-repo model:
+// the private pro_source repo IS the paid layer; there is no path matcher).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkPaidLayer, matchesProPaths } from "../../scripts/checks/paid-layer.mjs";
+import { checkPaidLayer } from "../../scripts/checks/paid-layer.mjs";
 
 const paidManifest = {
   namespace: "io.github.publisher",
@@ -16,7 +16,6 @@ const paidManifest = {
     price_hint: { amount: 9.99, currency: "USD", recurring: "month" },
     includes: [],
     pro_source: { type: "github", url: "https://github.com/publisher/private", path: "", ref: "main" },
-    pro_paths: ["pro/**"],
   },
 };
 
@@ -81,12 +80,4 @@ test("happy path: established bundle + resolving polar checkout → pass, honest
   assert.equal(r.passed, true);
   assert.match(r.reason, /display-only/);
   assert.match(r.reason, /never materialized publicly/);
-});
-
-test("matchesProPaths (vendored): pro/** any depth, fail-closed at root", () => {
-  assert.equal(matchesProPaths("pro/a.md", ["pro/**"]), true);
-  assert.equal(matchesProPaths("pro/deep/b.md", ["pro/**"]), true);
-  assert.equal(matchesProPaths("a.md", ["pro/**"]), false);
-  assert.equal(matchesProPaths("processor/a.md", ["pro/**"]), false);
-  assert.equal(matchesProPaths("x.md", []), false);
 });
