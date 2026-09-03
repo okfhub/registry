@@ -143,7 +143,7 @@ test("schema: well-formed paid block validates with defaults", () => {
   assert.equal(r.passed, true);
 });
 
-test("schema: paid block rejects a non-polar provider and an empty pro_paths", () => {
+test("schema: rejects a non-polar provider; legacy pro_paths key is stripped", () => {
   const base = {
     schema_version: 1,
     name: "bundle",
@@ -163,11 +163,12 @@ test("schema: paid block rejects a non-polar provider and an empty pro_paths", (
       price_hint: { amount: 1, currency: "USD" },
       includes: [],
       pro_source: { type: "github", url: "https://github.com/p/x", path: "", ref: "main" },
-      pro_paths: ["pro/**"],
     },
   });
   assert.equal(badProvider.passed, false);
-  const emptyPaths = checkSchema({
+  // Whole-repo model: manifests written before the pro_paths removal keep
+  // parsing — the unknown key is dropped, the block stays valid.
+  const legacy = checkSchema({
     ...base,
     paid: {
       provider: "polar",
@@ -181,5 +182,5 @@ test("schema: paid block rejects a non-polar provider and an empty pro_paths", (
       pro_paths: [],
     },
   });
-  assert.equal(emptyPaths.passed, false);
+  assert.equal(legacy.passed, true);
 });

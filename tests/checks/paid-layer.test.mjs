@@ -1,12 +1,13 @@
-// paid-layer.test.mjs — the paid-layer gate check + the vendored pro_paths
-// matcher (paid-01).
+// paid-layer.test.mjs — the paid-layer gate check (paid-01, whole-bundle
+// model: a paid bundle's source IS the private repo; the gate never fetches it).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkPaidLayer, matchesProPaths } from "../../scripts/checks/paid-layer.mjs";
+import { checkPaidLayer } from "../../scripts/checks/paid-layer.mjs";
 
 const paidManifest = {
   namespace: "io.github.publisher",
   name: "bundle",
+  source: { type: "github", url: "https://github.com/publisher/private", path: "", ref: "main" },
   paid: {
     provider: "polar",
     organization_id: "org-1",
@@ -15,8 +16,6 @@ const paidManifest = {
     checkout_url: "https://buy.polar.sh/prod-1",
     price_hint: { amount: 9.99, currency: "USD", recurring: "month" },
     includes: [],
-    pro_source: { type: "github", url: "https://github.com/publisher/private", path: "", ref: "main" },
-    pro_paths: ["pro/**"],
   },
 };
 
@@ -39,14 +38,27 @@ test("free bundle (no paid block) → n/a pass, no fetch", async () => {
   assert.equal(called, 0);
 });
 
-test("paid block on a NEW namespace (no merged free publish) → blocked", async () => {
+test("paid bundle as a FIRST listing → identity stage passes (no free-first rule)", async () => {
   const r = await checkPaidLayer({
     manifest: paidManifest,
     targetFileExistsOnMain: false,
     paidFetch: okFetch(),
   });
+  assert.equal(r.passed, true);
+  assert.match(r.reason, /declared, not evaluated/);
+});
+
+test("paid bundle with a non-github source → blocked (no gateway fetch path)", async () => {
+  const r = await checkPaidLayer({
+    manifest: {
+      ...paidManifest,
+      source: { type: "http", url: "https://example.com/b.tar.gz", path: "", ref: "main" },
+    },
+    targetFileExistsOnMain: true,
+    paidFetch: okFetch(),
+  });
   assert.equal(r.passed, false);
-  assert.match(r.reason, /at least one MERGED/);
+  assert.match(r.reason, /must be a github repo/);
 });
 
 test("non-Polar checkout host → blocked", async () => {
@@ -80,13 +92,5 @@ test("happy path: established bundle + resolving polar checkout → pass, honest
   });
   assert.equal(r.passed, true);
   assert.match(r.reason, /display-only/);
-  assert.match(r.reason, /never materialized publicly/);
-});
-
-test("matchesProPaths (vendored): pro/** any depth, fail-closed at root", () => {
-  assert.equal(matchesProPaths("pro/a.md", ["pro/**"]), true);
-  assert.equal(matchesProPaths("pro/deep/b.md", ["pro/**"]), true);
-  assert.equal(matchesProPaths("a.md", ["pro/**"]), false);
-  assert.equal(matchesProPaths("processor/a.md", ["pro/**"]), false);
-  assert.equal(matchesProPaths("x.md", []), false);
+  assert.match(r.reason, /declared, not evaluated/);
 });
