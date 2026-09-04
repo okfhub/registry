@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "data-census-gov",
+  "namespace": "io.github.asagajda",
+  "description": "Knowledge maps for data.census.gov — Page Objects and flows for the data-table, map-viewer, and landing page kinds; automate looking up census statistics by geography.",
+  "version": "0.1.0",
+  "source": {
+    "type": "github",
+    "url": "https://github.com/asagajda/data-census-gov",
+    "path": "",
+    "ref": "main"
+  },
+  "kind": "knowledge",
+  "categories": [
+    "census",
+    "browser-automation",
+    "data-gov",
+    "playwright"
+  ],
+  "license": "MIT"
+}
