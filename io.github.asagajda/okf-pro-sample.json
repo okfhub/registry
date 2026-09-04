@@ -20,7 +20,7 @@
     "organization_id": "578ace9c-eecc-40d5-8494-5e6bc8967267",
     "product_id": "782d4708-709f-474f-8c07-24ce4ea9a15f",
     "benefit_id": "517ec1bd-b6b5-4d35-a17a-bd32f46b74e0",
-    "checkout_url": "https://sandbox.polar.sh/checkout/polar_cl_3OmvPCBCAqiMAV8IvTZZphXyTvw9U2I3lmKOf457J6b",
+    "checkout_url": "https://sandbox-api.polar.sh/v1/checkout-links/polar_cl_3OmvPCBCAqiMAV8IvTZZphXyTvw9U2I3lmKOf457J6b/redirect",
     "price_hint": {
       "amount": 1,
       "currency": "usd",
