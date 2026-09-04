@@ -1,31 +1,37 @@
 # Merge-gate CHECK — runs the four publish-PR checks on a fork PR (no secrets).
 #
-# This is the fork-PR-safe half of the split merge-gate. It runs on
-# pull_request (opened/synchronize/reopened) targeting main, using ONLY the
-# default GITHUB_TOKEN — which is the ONLY token available on a fork PR (repo
-# secrets and variables are withheld in that context). It evaluates schema +
-# path-scope + ownership + rate-limit and exits 0/1 to set a green/red signal.
+# SECURITY: uses on: pull_request_target (NOT pull_request). With
+# pull_request_target, the workflow file + checked-out scripts come from the
+# DEFAULT BRANCH (main), not the PR's fork. A contributor CANNOT modify the
+# workflow or the gate scripts in their PR to exfiltrate secrets — their
+# modifications are never executed. The scripts fetch the PR's manifest via the
+# GitHub Contents API (using github.event.pull_request.head.sha from the webhook
+# payload), not from the checkout, so they still validate the PR's content.
 #
-# It CANNOT comment or merge (GITHUB_TOKEN lacks those scopes on a fork PR).
+# Secrets ARE available under pull_request_target (unlike pull_request from a
+# fork), but this workflow deliberately references NONE — only the default
+# GITHUB_TOKEN (contents:read, pull-requests:read). The three repo secrets
+# (OKFHUB_APP_PRIVATE_KEY, OKFHUB_WEBSITE_TOKEN, UPSTASH_REDIS_REST_TOKEN)
+# are used exclusively by merge-gate-merge.yml and build-registry.yml, which
+# run in the default-branch context (workflow_run / push) and never on a
+# fork PR.
+#
+# It CANNOT comment or merge (the permissions block is read-only by design).
 # The downstream merge-gate-merge.yml (on: workflow_run) watches this green
 # signal, then mints the App token (secret available in the default-branch
 # workflow_run context) to merge + post the result comment.
-#
-# SECURITY: this workflow runs untrusted PR content's METADATA only — the
-# gate-check.mjs script fetches the manifest JSON via the GitHub API and
-# validates it with zod. It never executes PR-authored code.
 name: Merge publish PR (check)
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened]
 
 permissions:
   contents: read         # read the PR manifest via the Contents API
   pull-requests: read    # read PR state + changed files
-  # NOTE: deliberately NO write scopes. The fork-PR GITHUB_TOKEN cannot write
-  # anyway; keeping this read-only is defense-in-depth even if GitHub's
-  # behavior changes. Commenting + merging happen in merge-gate-merge.yml.
+  # NOTE: deliberately NO write scopes. Even though pull_request_target grants
+  # a write-capable GITHUB_TOKEN, this workflow never writes — commenting +
+  # merging happen in merge-gate-merge.yml (workflow_run context).
 
 jobs:
   check:
@@ -33,6 +39,11 @@ jobs:
     if: github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     steps:
+      # actions/checkout under pull_request_target checks out the DEFAULT BRANCH
+      # (main), not the PR's fork. This is intentional: the gate scripts come
+      # from the trusted base, not PR-authored code. The scripts fetch the PR's
+      # manifest via the GitHub API (clone-source.mjs uses the Contents API with
+      # the PR head SHA from the webhook payload).
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -40,6 +51,7 @@ jobs:
           node-version: "20"
 
       # Install the check scripts' deps (zod + gray-matter for structure.mjs).
+      # npm ci uses the base branch's package.json — a PR cannot inject deps.
       - name: Install check deps
         run: npm ci
         working-directory: scripts/checks
