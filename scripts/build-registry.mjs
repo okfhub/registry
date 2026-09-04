@@ -75,13 +75,33 @@ export const SourceSchema = z.object({
   ref: z.string().default("main"),
 });
 
+// paid-01 — the paid-layer block. VENDORED mirror of okfhub-cli
+// src/lib/manifest.ts PaidSchema (the coordinated 4-copy rule: CLI manifest.ts,
+// scripts/checks/schema.mjs, okfhub-website/lib/types.ts, and THIS file).
+// Without this, zod's safeParse silently strips the paid block during build,
+// so the live registry.json never carries it and the website can't render the
+// buy CTA — even though the gate's own schema.mjs already validated it fine.
+export const PaidSchema = z.object({
+  provider: z.literal("polar"),
+  organization_id: z.string().min(1),
+  product_id: z.string().min(1),
+  benefit_id: z.string().min(1),
+  checkout_url: z.string().url(),
+  price_hint: z.object({
+    amount: z.number().nonnegative(),
+    currency: z.string().regex(/^[a-zA-Z]{3}$/),
+    recurring: z.enum(["day", "week", "month", "year"]).nullish(),
+  }),
+  includes: z.array(z.string().min(1)).default([]),
+});
+
 export const ManifestSchema = z.object({
   schema_version: z.literal(1),
   // WR-07: constrain name to the resolver's lowercase-kebab shape. The namespace
   // is regex-anchored but name was only z.string().min(1), so a manifest name
   // like "../../public/registry" would let join(CONCEPTS_DIR, ns, name, relPath)
   // collapse the ".." and write outside concepts/. Mirror the namespace shape.
-  name: z.string().regex(/^[a-z0-9-]+$/, "name must be lowercase-kebab (a-z, 0-9, -) only"),
+  name: z.string().regex(/^[a-z0-9-]+$/, "name must be lowercase-kebab (a-z, 0, -) only"),
   namespace: z.string().regex(/^io\.(github|http)\.[a-z0-9.-]+$/),
   description: z.string(),
   version: z.string(),
@@ -90,6 +110,8 @@ export const ManifestSchema = z.object({
   categories: z.array(z.string()).default([]),
   license: z.string().optional(),
   homepage: z.string().url().optional(),
+  // paid-01 — additive + optional; absent on free-only bundles.
+  paid: PaidSchema.optional(),
 });
 
 // Scan EVERY io.github.* namespace directory, not just io.github.google. The

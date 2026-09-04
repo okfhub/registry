@@ -209,6 +209,16 @@ async function main() {
   if (!manifest) {
     throw new Error(`clone-source: could not read manifest ${manifestPath} at the PR head.`);
   }
+  // PAID bundles: the source is a PRIVATE repo — the GITHUB_TOKEN can't clone
+  // it, and the registry evaluates paid bundles as "declared, not evaluated"
+  // (paid-layer.mjs handles the paid-specific checks). Skip the structural
+  // clone entirely; STRUCTURE_BUNDLE_DIR stays empty, which gates check #5
+  // off in gate-check.mjs (the same skip path as an io.http.* PR with no
+  // manifest, or a source.type the build doesn't clone for).
+  if (manifest.paid) {
+    console.log("clone-source: paid bundle — source is private, structural clone skipped (declared, not evaluated).");
+    return;
+  }
   // Source-type dispatch (Phase 8 — BLOCKER 2 fix, T-08-DISPATCH). The L183 throw
   // that crashed the gate on every io.http.* PR is replaced by a dispatch: github
   // → cloneAndExtract; http → fetchHttpSource. The throw narrows to fire ONLY for

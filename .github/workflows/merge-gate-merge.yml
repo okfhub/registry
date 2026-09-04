@@ -1,17 +1,19 @@
 # Merge-gate MERGE — fires after the check workflow completes; mints the App
 # token (secret) and merges all-green PRs. This is the half that NEEDS secrets.
 #
-# WHY on: workflow_run (not pull_request): a workflow triggered by
-# pull_request from a FORK receives only the default GITHUB_TOKEN — repo
-# secrets AND variables are withheld (docs: "secrets are not passed to the
-# runner when a workflow is triggered from a forked repository"). The merge
-# needs the App private key (secret OKFHUB_APP_PRIVATE_KEY) to mint an
-# installation token that can merge AND trigger the downstream
-# build-registry.yml. workflow_run fires in the DEFAULT-BRANCH context, so
-# secrets ARE available. GitHub recommends this pattern specifically for
-# fork-PR + secrets.
+# WHY on: workflow_run (not pull_request_target): the check workflow uses
+# pull_request_target (which DOES have secret access), so secrets would be
+# available there. But the split is kept for two reasons: (1) defense-in-depth
+# — the check half runs read-only with no secrets referenced, and the merge
+# half runs only after the check completes green; (2) the merge needs an App
+# INSTALLATION token (not the default GITHUB_TOKEN) to merge AND trigger the
+# downstream build-registry.yml (merges performed with GITHUB_TOKEN do NOT fire
+# on:push / on:workflow_run events — the "events triggered by the default token
+# don't trigger new workflows" rule). workflow_run fires in the DEFAULT-BRANCH
+# context, and the App private key (secret OKFHUB_APP_PRIVATE_KEY) is only
+# referenced here, never in the check workflow.
 #
-# CHAIN: merge-gate-check.yml (pull_request) → [this] merge-gate-merge.yml
+# CHAIN: merge-gate-check.yml (pull_request_target) → [this] merge-gate-merge.yml
 # (workflow_run). The `workflow_run.head_workflow` filter ensures we only fire
 # after the CHECK workflow, not any other workflow.
 #

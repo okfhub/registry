@@ -29,6 +29,8 @@ const POLAR_CHECKOUT_HOSTS = new Set([
   "www.polar.sh",
   "buy.polar.sh",
   "sandbox.polar.sh", // the sandbox checkout — allowed so test publishes flow
+  "api.polar.sh", // Polar API checkout-link redirect endpoint (prod)
+  "sandbox-api.polar.sh", // Polar API checkout-link redirect endpoint (sandbox)
 ]);
 
 /**
