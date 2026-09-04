@@ -3,3 +3,13 @@ node_modules/
 # The GitHub Action commits it cross-repo into okfhub-website/public/registry.json;
 # it is not hand-authored here.
 registry.json
+# concepts/ is a generated artifact (Phase 5, D-04/D-05): build-registry.mjs
+# materializes concept bodies here alongside registry.json, and the GitHub Action
+# commits the tree cross-repo into okfhub-website/public/concepts/. Like
+# registry.json, it is regenerated fresh on every build — never hand-authored here.
+concepts/
+# graphs.json is a generated artifact (Phase 10, D-03): build-registry.mjs emits
+# the per-bundle concept graphs here alongside registry.json, and the GitHub
+# Action commits it cross-repo into okfhub-website/public/graphs.json. Like
+# registry.json, it is regenerated fresh on every build — never hand-authored here.
+graphs.json

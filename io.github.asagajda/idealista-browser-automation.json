@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "idealista-browser-automation",
+  "namespace": "io.github.asagajda",
+  "description": "Playwright Page Objects for idealista.com \u2014 automate Spanish property search: browse listings, search results, filter, paginate, view listing details, contact advertisers.",
+  "version": "0.1.0",
+  "source": {
+    "type": "github",
+    "url": "https://github.com/asagajda/idealista-browser-automation",
+    "path": "",
+    "ref": "main"
+  },
+  "kind": "knowledge",
+  "categories": [
+    "browser-automation",
+    "real-estate",
+    "idealista",
+    "playwright"
+  ],
+  "license": "MIT"
+}

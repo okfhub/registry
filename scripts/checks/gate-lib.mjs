@@ -32,13 +32,28 @@
 import { readFile } from "node:fs/promises";
 
 import { checkSchema } from "./schema.mjs";
-import { checkPathScope, namespaceOrgFromPath } from "./path-scope.mjs";
-import { checkOwnership } from "./ownership.mjs";
+import { checkPathScope, namespaceOrgFromPath, namespaceFamilyFromPath } from "./path-scope.mjs";
+import { checkOwnership, checkDnsOwnership } from "./ownership.mjs";
 import { checkRateLimit } from "./rate-limit.mjs";
 import { checkStructure } from "./structure.mjs";
+import { checkPaidLayer } from "./paid-layer.mjs";
+import { challengeRecordName, verifyDnsChallenge } from "./dns-verify.mjs";
 
 const API = process.env.GITHUB_API_URL || "https://api.github.com";
 const POLICY_PATH = process.env.REGISTRY_POLICY_PATH || "registry-policy.json";
+
+// DNS-ownership propagation-retry loop (Phase 8, user-driven addition). When a
+// publisher adds the TXT record and immediately re-runs the gate, the record
+// may not yet have propagated to the authoritative NS. The gate retries every
+// DNS_RETRY_INTERVAL_MS (5s) for up to DNS_RETRY_BUDGET_MS (60s) before
+// declaring failure. This is INSIDE the check (still a one-shot CI run), NOT a
+// separate polling server — bounded (60s ceiling) + fixed interval (5s), NOT
+// configurable in this commit (avoid scope creep). Honors D-01 (no issuance
+// server) and addresses the enforcement-confidence question: a publisher who
+// adds the TXT and re-runs the gate within ~60s still passes without a spurious
+// red check.
+const DNS_RETRY_INTERVAL_MS = 5 * 1000;
+const DNS_RETRY_BUDGET_MS = 60 * 1000;
 
 /** Build a gh() fetcher bound to a specific token. Each entry point passes its
  *  own token (GITHUB_TOKEN for check, App installation token for merge). */
@@ -100,6 +115,32 @@ async function fetchChangedFiles(gh, repo, prNumber) {
   return files.map((f) => f.filename);
 }
 
+/** Does the author have push permission on this repo? (infra-PR gate.)
+ *
+ *  Uses GET /repos/{repo}/collaborators/{username}/permission, which returns
+ *  `{ permission, user: { ..., permissions: { admin, maintain, push, triage, pull } }, role_name }`.
+ *  The top-level `permission` is the canonical role string
+ *  ("admin"|"maintain"|"write"|"triage"|"read"|"none"). We treat
+ *  admin/maintain/write/triage as "maintainer" (can push), read/none as not.
+ *
+ *  BUGFIX: the previous implementation read `j.permissions.push` — but the
+ *  `permissions` object is nested inside `user`, not at the top level. So
+ *  `j.permissions` was always undefined, and isMaintainer returned false for
+ *  EVERY author (including admins). This silently broke the infra-PR gate path
+ *  from the day it was introduced (Phase 3, bbf48aa); it was never exercised
+ *  under the hardened main-protection ruleset (2026-08-04) because all prior
+ *  infra commits landed by direct push before the ruleset hardened.
+ *
+ *  Fail-closed: a non-2xx response is treated as "not a maintainer" so the
+ *  infra PR stays red rather than silently auto-approving on an API hiccup. */
+async function isMaintainer(gh, repo, authorLogin) {
+  const res = await gh(`/repos/${repo}/collaborators/${encodeURIComponent(authorLogin)}/permission`);
+  if (!res.ok) return false;
+  const j = await res.json().catch(() => ({}));
+  const role = j?.permission; // "admin"|"maintain"|"write"|"triage"|"read"|"none"
+  return role === "admin" || role === "maintain" || role === "write" || role === "triage";
+}
+
 /** Fetch the manifest JSON a PR publishes (from the head branch), if any. */
 async function fetchManifestAt(gh, repo, prNumber, filePath) {
   const prRes = await gh(`/repos/${repo}/pulls/${prNumber}`);
@@ -141,17 +182,68 @@ async function countRegistryPrsLastHour(gh, repo) {
 }
 
 /**
+ * Verify the DNS TXT challenge against the authoritative NS, retrying on
+ * failure for up to DNS_RETRY_BUDGET_MS at DNS_RETRY_INTERVAL_MS intervals
+ * (Phase 8 propagation-retry loop — user-driven addition).
+ *
+ * The retry is INSIDE the check (still a one-shot CI run): a publisher who adds
+ * the TXT record and immediately re-runs the gate, before DNS propagation
+ * completes, gets up to ~60s of retries rather than a spurious red check. Once
+ * the budget is exhausted (TXT still not present) or verifyDnsChallenge throws
+ * (resolver error), the loop returns false / rethrows so checkDnsOwnership
+ * fails-closed. NXDOMAIN within the window is a transient "not yet present"
+ * signal that verifyDnsChallenge swallows → false (retry); a thrown resolver
+ * error is a hard "fail-closed" signal (rethrow).
+ *
+ * Tests override the interval/budget via opts to keep the suite fast
+ * ({ dnsRetryInterval: 0, dnsRetryBudget: 0 } → a single immediate shot).
+ *
+ * @param {string} recordName
+ * @param {string} domain
+ * @param {string} expectedValue
+ * @param {object} [opts] - { resolver, dnsRetryInterval, dnsRetryBudget }
+ * @returns {Promise<boolean>}
+ */
+async function verifyDnsWithRetry(recordName, domain, expectedValue, opts = {}) {
+  const interval = opts.dnsRetryInterval ?? DNS_RETRY_INTERVAL_MS;
+  const budget = opts.dnsRetryBudget ?? DNS_RETRY_BUDGET_MS;
+  const start = Date.now();
+  for (;;) {
+    // verifyDnsChallenge returns false on NXDOMAIN (record not yet present) —
+    // retryable within the budget. A thrown error (resolver failure) rethrows so
+    // checkDnsOwnership fail-closes (T-08-GATE).
+    const ok = await verifyDnsChallenge(recordName, domain, expectedValue, opts);
+    if (ok) return true;
+    if (Date.now() - start >= budget) return false; // budget exhausted → not present
+    await sleep(interval);
+  }
+}
+
+function sleep(ms) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * Evaluate a publish PR against all four checks. PURE-ish: fetches PR state via
  * the given gh() fetcher, runs the checks, and returns a structured result.
  * Never calls process.exit, never posts comments, never merges — the caller
  * decides what to do with the result.
  *
+ * Phase 8 generalizes the manifest detection + ownership dispatch to a
+ * namespace-family model: io.github.* → org-membership (unchanged);
+ * io.http.* → DNS-ownership (re-derived token + authoritative-NS verify with a
+ * propagation-retry loop).
+ *
  * @param {object} gh - fetcher from makeGh(token)
  * @param {string} repo - "okfhub/registry"
  * @param {object} pr - the pull_request object from the event payload
- * @returns {Promise<{passed: boolean, reason: string|null, manifestPath: string|null, org: string|null, authorLogin: string, headSha: string, prNumber: number}>}
+ * @param {object} [opts] - injection seam for tests: { verifyDns (override the
+ *   authoritative-NS verifier), resolver (threaded to verifyDnsChallenge),
+ *   dnsRetryInterval, dnsRetryBudget }
+ * @returns {Promise<{passed: boolean, reason: string|null, manifestPath: string|null, org: string|null, authorLogin: string, headSha: string, prNumber: number, infra?: boolean}>}
  */
-export async function evaluatePullRequest(gh, repo, pr) {
+export async function evaluatePullRequest(gh, repo, pr, opts = {}) {
   const prNumber = pr.number;
   // D-05: identity from pull_request.user.login ONLY. Never pr.body.
   const authorLogin = pr.user?.login;
@@ -170,12 +262,40 @@ export async function evaluatePullRequest(gh, repo, pr) {
   }
 
   const changedFiles = await fetchChangedFiles(gh, repo, prNumber);
-  // The target manifest = the io.github.<org>/<name>.json the PR publishes.
-  const manifestPath = changedFiles.find((f) => /^io\.github\.[a-z0-9-]+\//.test(f));
+  // The target manifest = the io.<family>.<segment>/<name>.json the PR publishes.
+  // Phase 8 widens from io.github.* to io.(github|http).* (http segment is a
+  // domain, so it allows dots + hyphens).
+  const manifestPath = changedFiles.find((f) => /^io\.(github|http)\.[a-z0-9.-]+\//.test(f));
   if (!manifestPath) {
+    // INFRA PR (no manifest): maintenance changes to scripts/, tests/, .github/,
+    // lib/, docs, etc. These cannot be evaluated by the publish checks (there is
+    // no namespace to own / no source to clone). They pass the gate ONLY when the
+    // PR author is a repo collaborator with push permission — i.e. a trusted
+    // maintainer (admin/maintain/write/triage). A fork/external author's infra PR
+    // stays RED (existing behavior), so no privilege-escalation surface opens:
+    // a fork can't auto-merge code into scripts/ or .github/workflows/.
+    //
+    // The result carries `infra: true` so gate-merge.mjs knows to post a comment
+    // and STOP — it does NOT auto-merge infra PRs (a human merges those). This
+    // keeps the publish-only auto-merge contract intact while letting the
+    // required-status `check` go green for maintainer infra PRs.
+    const infra = await isMaintainer(gh, repo, authorLogin);
+    if (infra) {
+      return {
+        passed: true,
+        infra: true,
+        reason: null,
+        manifestPath: null,
+        org: null,
+        authorLogin,
+        headSha,
+        prNumber,
+      };
+    }
     return {
       passed: false,
-      reason: `⚠️ merge-gate: no \`io.github.<org>/<name>.json\` manifest found among the changed files (${changedFiles.map(sanitizeForComment).join(", ")}). Publish PRs must add exactly one manifest under \`io.github.*\`.`,
+      reason: `⚠️ merge-gate: no \`io.github.<org>/<name>.json\` manifest found among the changed files (${changedFiles.map(sanitizeForComment).join(", ")}). Publish PRs must add exactly one manifest under \`io.github.*\`; infra PRs (no manifest) must come from a collaborator with write permission.`,
+      infra: false,
       manifestPath: null,
       org: null,
       authorLogin,
@@ -184,6 +304,13 @@ export async function evaluatePullRequest(gh, repo, pr) {
     };
   }
   const org = namespaceOrgFromPath(manifestPath);
+  // Phase 8 namespace-family detection. For io.github.*, family=github + the
+  // segment is the org (org === segment, backward compat). For io.http.*, the
+  // segment is the domain; the org-membership check does not apply — a DNS
+  // challenge proves ownership instead.
+  const { family, segment } = namespaceFamilyFromPath(manifestPath);
+  const fam = family ?? "github";
+  const domain = fam === "http" ? segment : null;
 
   // 1) SCHEMA — fetch the manifest at head + validate (AUTH-03 enforced here).
   const manifestJson = await fetchManifestAt(gh, repo, prNumber, manifestPath);
@@ -226,10 +353,21 @@ export async function evaluatePullRequest(gh, repo, pr) {
   // consistent by construction (publish.ts derives the path FROM the field);
   // this blocks hand-crafted PRs.
   const declaredNamespace = manifestJson.namespace;
-  if (typeof declaredNamespace !== "string" || declaredNamespace.toLowerCase() !== `io.github.${org}`) {
+  // Per-family namespace field/path consistency (T-08-CONSISTENCY). For github,
+  // require declaredNamespace === io.github.<org>. For http, require
+  // declaredNamespace === io.http.<domain>. Both canonical-lowercase. A
+  // mismatch indicates a hand-crafted PR attempting namespace impersonation in
+  // the index (the CLI derives path from field by construction).
+  const expectedDeclaredNamespace =
+    fam === "http" ? `io.http.${domain}` : `io.github.${org}`;
+  if (
+    typeof declaredNamespace !== "string" ||
+    declaredNamespace.toLowerCase() !== expectedDeclaredNamespace
+  ) {
+    const expectedPathPrefix = fam === "http" ? `io.http.${domain}` : `io.github.${org}`;
     return {
       passed: false,
-      reason: `🚫 **merge-gate blocked**\n\nnamespace: manifest declares \`${sanitizeForComment(declaredNamespace)}\` but lives at path \`io.github.${org}/\` — the declared namespace must match the file's path. The CLI derives the path from the namespace by construction; a mismatch indicates a hand-crafted PR attempting namespace impersonation in the index.`,
+      reason: `🚫 **merge-gate blocked**\n\nnamespace: manifest declares \`${sanitizeForComment(declaredNamespace)}\` but lives at path \`${expectedPathPrefix}/\` — the declared namespace must match the file's path. The CLI derives the path from the namespace by construction; a mismatch indicates a hand-crafted PR attempting namespace impersonation in the index.`,
       manifestPath,
       org,
       authorLogin,
@@ -238,8 +376,9 @@ export async function evaluatePullRequest(gh, repo, pr) {
     };
   }
 
-  // 2) PATH-SCOPE (D-07).
-  const pathResult = checkPathScope({ changedFiles, org });
+  // 2) PATH-SCOPE (D-07). Pass the family + segment so the per-family prefix
+  // (io.github.<org>/ or io.http.<domain>/) is enforced.
+  const pathResult = checkPathScope({ changedFiles, org, family: fam, segment });
   if (!pathResult.passed) {
     return {
       passed: false,
@@ -252,25 +391,61 @@ export async function evaluatePullRequest(gh, repo, pr) {
     };
   }
 
-  // 3) OWNERSHIP (AUTH-02 / D-05 / D-06). isOrgMember wired to the members API.
-  const ownershipResult = await checkOwnership({
-    org,
-    authorLogin,
-    isOrgMember: async (o, u) => {
-      // 204 = member; 404/302/others = not a member. Fail-closed on non-2xx.
-      // Uses the public_members endpoint (no extra scope needed).
-      const r = await gh(`/orgs/${o}/public_members/${u}`);
-      return r.status === 204;
-    },
-  });
+  // 3) OWNERSHIP — branch on namespace family (Phase 8).
+  //    io.github.* → org-membership (AUTH-02 / D-05 / D-06, UNCHANGED).
+  //    io.http.*   → DNS-ownership: re-derive the deterministic token via
+  //                  challengeRecordName + query the authoritative NS via
+  //                  verifyDnsChallenge (with the propagation-retry loop). Fail
+  //                  closed (block) on NXDOMAIN within the window or any
+  //                  resolver error (T-08-GATE). The expectedValue is the
+  //                  deterministic okfhub-verify=<namespace>/<name> string —
+  //                  the publish CLI computes the same token, so no issuance
+  //                  server (D-01).
+  let ownershipResult;
+  if (fam === "http" && domain) {
+    const recordName = challengeRecordName(
+      manifestJson.namespace,
+      manifestJson.name,
+      manifestJson.source?.url ?? "",
+      domain,
+    );
+    const expectedValue = `okfhub-verify=${manifestJson.namespace}/${manifestJson.name}`;
+    // The verifyChallenge callback re-derives + queries the authoritative NS.
+    // Tests inject opts.verifyDns to avoid live DNS; production uses the real
+    // verifyDnsChallenge wrapped in the propagation-retry loop.
+    const verifyChallenge =
+      opts.verifyDns ??
+      (async (rn, dom, ev) => verifyDnsWithRetry(rn, dom, ev, opts));
+    ownershipResult = await checkDnsOwnership({
+      domain,
+      recordName,
+      expectedValue,
+      verifyChallenge,
+    });
+  } else {
+    ownershipResult = await checkOwnership({
+      org,
+      authorLogin,
+      isOrgMember: async (o, u) => {
+        // 204 = member; 404/302/others = not a member. Fail-closed on non-2xx.
+        // Uses the public_members endpoint (no extra scope needed).
+        const r = await gh(`/orgs/${o}/public_members/${u}`);
+        return r.status === 204;
+      },
+    });
+  }
   if (!ownershipResult.passed) {
     // Audit H2: when ownership fails on the ORG-membership path (org ≠ author),
     // the public_members endpoint can't distinguish a private member from a
     // non-member. Append the self-serviceable fix so a legitimate but
     // private-member publisher isn't left guessing. The check function itself
     // stays generic; only the posted comment carries this product hint.
+    // Phase 8: this hint is github-only (the http path has no org/membership).
     const orgMembershipHint =
-      org.toLowerCase() !== authorLogin.toLowerCase() && /member of org/.test(ownershipResult.reason)
+      fam === "github" &&
+      org &&
+      org.toLowerCase() !== authorLogin.toLowerCase() &&
+      /member of org/.test(ownershipResult.reason)
         ? `\n\nℹ️ Org-namespace publishing checks PUBLIC org membership only. If you are a member of \`${org}\` but your membership is private, the gate can't see it — either make it public (https://github.com/orgs/${org}/people → "Publicize") or publish under your personal namespace \`io.github.${authorLogin.toLowerCase()}\`.`
         : "";
     return {
@@ -313,6 +488,27 @@ export async function evaluatePullRequest(gh, repo, pr) {
     };
   }
 
+  // 4.5) PAID LAYER (paid-01). Runs ONLY when the manifest declares a `paid`
+  //     block (free bundles short-circuit). Enforces: the free bundle already
+  //     exists on main, and checkout_url is a resolving polar.sh checkout.
+  //     `exists` was computed for the rate-limit step (same fact either way).
+  const paidResult = await checkPaidLayer({
+    manifest: manifestJson,
+    targetFileExistsOnMain: exists,
+    ...(opts.paidFetch && { paidFetch: opts.paidFetch }),
+  });
+  if (!paidResult.passed) {
+    return {
+      passed: false,
+      reason: `🚫 **merge-gate blocked**\n\n${paidResult.reason}`,
+      manifestPath,
+      org,
+      authorLogin,
+      headSha,
+      prNumber,
+    };
+  }
+
   // 5) STRUCTURAL IDENTITY (D-02 / D-08, VAL-02). Runs ONLY in the check half,
   //    which cloned the PR's source repo and set STRUCTURE_BUNDLE_DIR. The merge
   //    half re-runs evaluatePullRequest WITHOUT it (the registry-scoped App
@@ -341,15 +537,20 @@ export async function evaluatePullRequest(gh, repo, pr) {
   return { passed: true, reason: null, manifestPath, org, authorLogin, headSha, prNumber };
 }
 
-/** Merge the PR via the App installation token (D-08 / AUTH-04). */
-export async function mergePr(gh, repo, prNumber, headSha, commitTitle) {
+/** Merge the PR via the App installation token (D-08 / AUTH-04).
+ *  NOTE: `sha` is deliberately omitted — the App installation token is scoped to
+ *  the base repo only (okfhub/registry), not the fork (asagajda/registry). When
+ *  `sha` is present, GitHub validates the head commit against the fork repo, which
+ *  the App token cannot access → 403 "Resource not accessible by integration".
+ *  Without `sha`, the merge succeeds but trades off the head-pin guard (the
+ *  evaluate-and-merge is near-instant, so drift is negligible). */
+export async function mergePr(gh, repo, prNumber, _headSha, commitTitle) {
   const res = await gh(`/repos/${repo}/pulls/${prNumber}/merge`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       commit_title: commitTitle,
       merge_method: "squash",
-      sha: headSha, // pin the head — 409 on drift is handled by the caller
     }),
   });
   return res;
